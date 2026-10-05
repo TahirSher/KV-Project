@@ -20,33 +20,41 @@ R  Representational lexicality: linear decodability of word/nonword status from
    ("Here is a letter string: <string>").  This is not a task.
 B  Behavioural lexical decision: the model's own few-shot answer under a task
    prompt, scored probe-free as logit(" Yes") - logit(" No") at the answer
-   position (the position whose output is the first generated token).
+   position (the position whose output is the first generated token), together
+   with the probability mass on the two answer tokens (task-format retention).
 Both are measured under every deterministic policy, so representational damage is
 related to task damage (H8) instead of being assumed to imply it.
 
-Hypotheses and pre-registered decision rules (evaluated by code ->
-paper_artifacts/decision_rules.csv).  A count rule is "supported" when it holds
-in >= ceil(7/9 * n_models) models; every verdict is re-evaluated leaving one
-model family out (LOFO) and excluding mixed RoPE/NoPE models.
+Hypotheses and pre-specified decision rules (evaluated by code ->
+paper_artifacts/decision_rules.csv).  Code-defined rules are pre-specified, not
+pre-registered: register prespecification_manifest.json (script and config hashes,
+written on the first run) and these rules on OSF before the full run.  A count rule
+is "supported" when it holds in >= ceil(7/9 * n_models) models; every verdict is
+re-evaluated leaving one model family out (LOFO) and excluding mixed RoPE/NoPE models.
   H1     `full` (CLA grouping of eligible layers) lowers lexical discriminability
-         vs no_reuse in >= 1 pre-registered depth band (Holm, item bootstrap, and
-         the percentile CI must exclude 0).  Primary metric per band: AUC, or the
-         ceiling-free Cohen's d of probe logits when the no_reuse band AUC is at
-         ceiling (>= CEILING_AUC; the choice depends only on no_reuse).
+         vs no_reuse in >= 1 depth band (Holm, item bootstrap, and the percentile
+         CI must exclude 0).  Primary metric per band: AUC, or the ceiling-free
+         Cohen's d of probe logits when the no_reuse band AUC is at ceiling
+         (>= CEILING_AUC; the choice depends only on no_reuse).
   H1x    the same in the exemption-free regime (sensitivity) and at reuse factor 4.
-  H1d    dose-response: damage increases with the number of substituted layers
-         (per-model exact Spearman test, one-sided).
-  H2     frequency-selective damage beyond tokenisation: item damage decreases with
-         log frequency given baseline evidence (ANCOVA), n_subword_tokens, length,
-         OrthoN and bigram frequency (HC3).  Models whose `full` policy is at the
+  H1d    dose-response at fixed source distance 1: damage increases with the number
+         of substituted layers (per-model exact Spearman test, one-sided).
+  H2     frequency-selective damage not routed through tokenisation: item damage
+         (change score) decreases with log frequency with n_subword_tokens, length,
+         OrthoN and bigram frequency controlled and NO baseline-evidence term (HC3).
+         Total effect, relative (proportional) damage and the direct effect at equal
+         baseline (ANCOVA) are reported.  Models whose `full` policy is at the
          lexical floor are not evaluable.
-  H3a    similar vs dissimilar partners, on a fixed CLA candidate set, under two
-         similarity measures: CKA (cka_high vs cka_low) and KVSharer's ranking
-         distance between layer-averaged flattened K/V (kvdist_low vs kvdist_high).
+  H3a    similar vs dissimilar partners: CKA and KVSharer's distance ranked within
+         the fixed CLA candidate pairs, and a KVSharer-style search over ALL layer
+         pairs (kvsharer_dissimilar vs kvsharer_similar).
   H3b    each gated policy vs depth-matched random target sets (randomisation test).
-  H3c    query-aware residual-stream fidelity vs CKA and vs KVSharer distance.
+  H3c    query-aware residual-stream fidelity vs CKA and vs within-CLA KV distance.
   H3d    each gated policy vs rate-matched uniform random target sets (randomisation).
-  H4     own group head vs a uniformly random earlier cached source (randomisation).
+  H3e    each KVSharer-search map vs uniformly random chain-free maps with the same
+         number of targets (randomisation).
+  H4     own group head vs a random eligible earlier head (randomisation); a SANITY
+         CHECK of the substitution engine, not a finding.
   C1     live vs clean semantics on the identical source map (counterfactual).
   C2     previous vs next group head, mirrored distance (counterfactual, clean).
   H5     single-layer substitution fragility peaks at normalised depth <= 0.60.
@@ -54,21 +62,34 @@ model family out (LOFO) and excluding mixed RoPE/NoPE models.
   H5x    the same n_token slope under exemption-free `full` sharing.
   H6     representational damage ranks policies like generative damage (log PPL).
   H7a    matched HF > LF lexical evidence in no_reuse (R and B readouts).
-  H7b    on matched HF/LF pairs, `full` damages LF more than HF.
-  H8a    few-shot behavioural lexical decision is above chance (validity gate).
-  H8b    `full` lowers behavioural lexical-decision AUC.
-  H8c    representational damage ranks policies like behavioural damage.
+  H7b    on matched HF/LF pairs, `full` damages LF more than HF (total effect).
+  H8a    few-shot behavioural lexical decision is above chance and the model puts
+         >= BEHAVIOR_MIN_BASE_MASS probability on the answer tokens (validity gate).
+  H8b    `full` lowers behavioural AUC; evaluable only where the answer format
+         survives (answer mass >= BEHAVIOR_MASS_MIN_RATIO x no_reuse).
+  H8c    representational damage ranks format-retaining policies like behavioural damage.
   RQ8a   contextual layers carry lexical information beyond a non-contextual
          baseline (static subword embeddings + surface features).
   RQ8b   a linear readout is adequate (best MLP gains <= LINEAR_ADEQUACY_TOL AUC).
 
+Estimands for frequency selectivity (H2, H7b)
+---------------------------------------------
+Frequency is not randomised and it causes baseline evidence, so baseline evidence
+is a mediator: conditioning on it (ANCOVA) estimates only the direct effect at
+equal baseline and can induce collider bias if an item property (e.g. embedding
+norm, anisotropy) affects both baseline evidence and damage (Lord, 1967; Pearl,
+2001).  The primary estimand is therefore the change score (frequency effect on
+damage with tokenisation and orthography held fixed); conditioning on n_tokens
+assumes no unmeasured common cause of n_tokens and damage beyond the orthographic
+covariates.  Relative damage (selected on baseline evidence) is descriptive.
+
 Changes relative to v11 (audit item -> fix)
 -------------------------------------------
-C1 (AUC ceiling)  Cohen's d of probe logits (unbounded; equals sqrt(2)*Phi^-1(AUC)
+C1 (AUC ceiling)  Cohen's d of probe logits (unbounded; AUC = Phi(d / sqrt(2))
      under the equal-variance binormal model) is computed everywhere and becomes the
      primary band metric at ceiling; frequency claims use item-level evidence
-     regressions (primary) and a hardest contrast, LF words vs wordlike nonwords
-     (high OrthoN / bigram frequency), is added.
+     regressions and a hardest contrast, LF words vs wordlike nonwords (high
+     OrthoN / bigram frequency), is added.
 C2 (exempt layers hide detokenisation)  exemption-free `full` regime (H1x, H5x);
      the fragility scan covers every layer (H5, H5m).
 C3 (random-control variance ignored)  random families are inferential nulls with
@@ -76,12 +97,18 @@ C3 (random-control variance ignored)  random families are inferential nulls with
      larger), tested by exact / Monte-Carlo randomisation (Phipson & Smyth, 2010),
      mid-p (Lancaster, 1961), combined across models by Stouffer's statistic
      referred to its exact randomisation null (correct size for tiny null spaces).
-C4 (KVSharer not tested)  kvdist_low / kvdist_high use KVSharer's ranking quantity
-     (Euclidean distance of layer-averaged, flattened K/V).  KVSharer's greedy
-     search with output-similarity verification is NOT replicated: claims are about
-     its ranking criterion on a fixed candidate set.
+     Randomisation inference is conditional on the test items; item-level
+     generalisation rests on the item-bootstrap contrasts.
+C4 (KVSharer not tested)  kvdist_low / kvdist_high rank KVSharer's distance within
+     the CLA candidate pairs only (named accordingly).  kvsharer_dissimilar runs a
+     KVSharer-style search over all pairs s < t (t eligible): ranked by distance,
+     greedy, chain-free, each pair accepted only if the final-layer cosine on
+     calibration items stays >= KVSHARER_COS_THRESHOLD; kvsharer_similar is the
+     same search in ascending order.  The threshold must be taken from KVSharer's
+     released configuration before the full run.
 C5 (no dose-response)  gate fractions 1/6, 1/3, 1/2 plus `full` at reuse factors
-     2 and 4 (H1d); lexical-floor and generative-floor flags.
+     2 and 4; the H1d test uses distance-1 points only (reuse factor 4 confounds
+     dose with source distance and is reported, not tested).
 M1  leave-one-family-out verdicts and family-level summaries.
 M2  every bootstrap decision also requires the percentile CI to exclude 0.
 M3  RoPE/NoPE layer flags per model, mismatch counts per policy, and verdicts
@@ -90,8 +117,10 @@ M4  model-internal familiarity (log P of the string in the carrier) as a second
      frequency measure.
 M5  probe-fitting uncertainty: inference is conditional on fitted probes (seed
      averaged); stated in outputs.
-M6  items are filtered by every tokenizer before balancing, so every model sees
-     exactly the same items; exclusions are reported per model.
+M6  items are filtered by the tokenizers of ALL models before balancing and stored
+     with a manifest; a mismatching cached table (pilot cap, model subset, other
+     templates or inputs) is refused, and subset jobs never build it
+     (KV_BUILD_ITEMS_ONLY=1 builds it once).  Give a pilot its own KV_OUTPUT_DIR.
 M7  long-context use is out of scope for the lexical probes (stated); generation
      over 1024-token windows is covered by H6.
 Further corrections found in the v11 code
@@ -101,14 +130,11 @@ Further corrections found in the v11 code
     *training* accuracy is reported only as memorisation capacity.
   * v11 counted H3 "supported" from significant models of either sign.  Verdicts
     are now directional.
-  * v11's H2 change-score outcome is confounded with baseline strength (a uniform
-    proportional loss makes strong, high-frequency items lose more); ANCOVA on the
-    baseline evidence is primary (Senn, 2006), the change score is reported.
   * v11's C1 compared `full` with `cf_prev_head` although the latter lacks the last
     group's targets; C1 now uses `live_prev_head`, the identical map under live
     semantics.
   * v11's H4 null excluded the own head, so `full` was not exchangeable with its
-    null; the null now draws each source uniformly from all earlier cached layers.
+    null; the null now includes it (and excludes exempt layers).
   * retrained readouts select lambda on the policy's own validation split.
   * the attention-output criterion is measured in the residual stream (after W_O).
   * frozen readouts of every policy use one code path and one fixed batch plan, so
@@ -120,9 +146,16 @@ Limitations that the design cannot remove (state them in the paper)
     morphology are not controlled (no norms in the inputs).
   * Prefill representations of ~10-token sequences; long-context lexical use is
     not measured.
-  * Per-model randomisation tests have resolution 1/|null space| (e.g. 4-15 sets
-    in a 16-layer model); selection claims rest on the cross-model combination.
+  * Per-model randomisation tests have resolution 0.5/|null space|; a depth-matched
+    null of a 16-layer model holds 1-4 sets (a 1-set null is excluded as no test).
+    Selection claims rest on the cross-model combination; null_space_sizes.csv
+    reports every model's resolution.
   * Models are not independent draws (three families); LOFO verdicts are reported.
+  * Compute: ~180 (16 layers) to ~520 (36 layers) primary-regime runs per model
+    (~4,100 for the nine models; ~10 per model are full-tier), plus fragility and
+    generation passes; full-tier runs hold all-layer states of all
+    items (~18-21 GB for an 8B model; KV_STATE_STORE=disk moves them to disk).
+    Time a pilot (timing_summary.csv) before committing GPU-days.
 
 Requirements: python>=3.10, torch>=2.1, transformers>=4.53, scikit-learn, scipy,
 statsmodels, pandas, matplotlib; `datasets` for the generative evaluation.
@@ -138,11 +171,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")      # deterministic cuBLAS
 
 import gc
+import hashlib
 import itertools
 import json
 import logging
 import math
 import re
+import shutil
 import sys
 import time
 import zlib
@@ -290,6 +325,12 @@ class ExperimentConfig:
                                                ("trelk", 0), ("snorb", 0), ("table", 1))
     TASK_ITEM: str = "String: {stimulus}\nAnswer:"
     TASK_ANSWERS: Tuple[str, str] = (" Yes", " No")
+    BEHAVIOR_MIN_BASE_MASS: float = 0.5            # H8a: no_reuse must put >= this mass on Yes/No
+    BEHAVIOR_MASS_MIN_RATIO: float = 0.5           # H8b/H8c: policy keeps >= this share of that mass
+    RELATIVE_DAMAGE_MIN_BASE: float = 0.5          # relative damage only where baseline evidence >= 0.5 SD
+    # The item table is filtered by the tokenizers of ALL these models, whatever subset
+    # a job runs (default: every model in MODELS at construction).
+    ITEM_FILTER_MODEL_IDS: List[str] = field(default_factory=list)
     MAX_ITEMS_PER_CLASS: Optional[int] = None      # None = all balanced items
     HIGH_FREQ_PERCENTILE: float = 66.0             # extreme tertiles for HF / LF
     LOW_FREQ_PERCENTILE: float = 33.0
@@ -319,6 +360,11 @@ class ExperimentConfig:
     COUNTERFACTUAL_ENABLED: bool = True
     CALIB_N_ITEMS: int = 1024                      # drawn from the TRAIN split
     CALIB_MAX_ROWS: int = 4096
+    # KVSharer acceptance: mean cosine of final-layer states with vs without the map on
+    # calibration items.  KVSharer's own threshold must be copied from its released
+    # configuration before the full run; this default is ours, not the paper's.
+    KVSHARER_COS_THRESHOLD: float = 0.90
+    KVSHARER_CHECK_ITEMS: int = 256
 
     # ── Inference ─────────────────────────────────────────────────────
     N_BANDS: int = 3                               # early / middle / late eligible
@@ -369,6 +415,10 @@ class ExperimentConfig:
 
     RESUME: bool = True
     DPI: int = 300
+    # Full-tier runs hold every layer's state for every item (~18-21 GB for an 8B
+    # model with ~70k items in bf16).  "disk" keeps them in bit-exact memory maps.
+    STATE_STORE: str = os.environ.get("KV_STATE_STORE", "memory")
+    STATE_DIR: str = os.environ.get("KV_STATE_DIR", "")
 
     def __post_init__(self):
         roles = [r.role for r in self.REGIMES]
@@ -383,6 +433,10 @@ class ExperimentConfig:
             raise ValueError("PRIMARY_GATE_FRACTION must be one of GATE_FRACTIONS")
         if self.STIMULUS_TEMPLATE.count("{stimulus}") != 1 or not self.STIMULUS_TEMPLATE.endswith("{stimulus}"):
             raise ValueError("STIMULUS_TEMPLATE must contain '{stimulus}' once, at the end")
+        if self.STATE_STORE not in ("memory", "disk"):
+            raise ValueError("STATE_STORE must be 'memory' or 'disk'")
+        if not self.ITEM_FILTER_MODEL_IDS:
+            self.ITEM_FILTER_MODEL_IDS = [m.model_id for m in self.MODELS]
         self.RESULTS_DIR = os.path.join(self.OUTPUT_DIR, "results")
         self.PAPER_DIR = os.path.join(self.OUTPUT_DIR, "paper_artifacts")
         for d in (self.OUTPUT_DIR, self.RESULTS_DIR, self.PAPER_DIR):
@@ -496,8 +550,10 @@ class CriterionMeter:
     query-aware residual-stream error of reading the source's K/V:
         err = || W_O (A(q_t, K_s, V_s) - A(q_t, K_t, V_t)) ||^2
         own = || o_proj(A(q_t, K_t, V_t)) ||^2
-    W_O is applied without its bias, which cancels in a difference.  Results of a
-    batch are committed only after its forward pass completes, so a batch that is
+    W_O is applied without its bias, which cancels in a difference.  For EVERY
+    layer it also accumulates the sum of flattened [K; V] stimulus rows, giving the
+    layer-averaged K/V that KVSharer ranks all layer pairs by.  Results of a batch
+    are committed only after its forward pass completes, so a batch that is
     retried after an out-of-memory error is never counted twice.
     """
 
@@ -508,7 +564,7 @@ class CriterionMeter:
         self.row_mask: Optional[torch.Tensor] = None
         self.batch_kv: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.rows: Dict[str, Dict[int, List[torch.Tensor]]] = {
-            name: defaultdict(list) for name in ("k", "v", "err", "own")}
+            name: defaultdict(list) for name in ("k", "v", "err", "own", "kv_sum")}
         self._pending: Dict[str, Dict[int, List[torch.Tensor]]] = {}
 
     def begin_batch(self, row_mask: torch.Tensor):
@@ -529,9 +585,11 @@ class CriterionMeter:
     def attend(self, module, query, key, value, mask, kwargs):
         li = module.layer_idx
         out = _BASE_ATTENTION(module, query, key, value, mask, **kwargs)
+        k_rows, v_rows = self._rows(key), self._rows(value)
+        self._pending["kv_sum"][li].append(torch.cat([k_rows, v_rows], 1).sum(0, keepdim=True))
         if li in self.layers:
-            self._pending["k"][li].append(self._rows(key))
-            self._pending["v"][li].append(self._rows(value))
+            self._pending["k"][li].append(k_rows)
+            self._pending["v"][li].append(v_rows)
         if li in self.sources:
             self.batch_kv[li] = (key, value)
         src = self.pairs.get(li)
@@ -556,6 +614,8 @@ NO_REUSE = "no_reuse"
 FULL = "full"
 UNIFORM = "random_same_ratio"
 RANDOM_SOURCE = "random_source"
+RANDOM_PAIRS = "random_pairs"
+KVSHARER_FAMILIES = ("kvsharer_dissimilar", "kvsharer_similar")
 DEPTH_PREFIX = "rdm_"
 LIVE_PREV = "live_prev_head"
 CF_PREV = "cf_prev_head"
@@ -579,7 +639,7 @@ def group_heads(num_layers: int, reuse_factor: int, ec: int) -> Dict[int, int]:
 
 
 def eligible_bands(num_layers: int, ec: int, n_bands: int) -> Dict[str, List[int]]:
-    """Pre-registered contiguous equal-count bands over eligible layers + 'all'."""
+    """Pre-specified contiguous equal-count bands over eligible layers + 'all'."""
     names = ["early", "middle", "late"] if n_bands == 3 else [f"band{i + 1}" for i in range(n_bands)]
     eligible = np.arange(ec, num_layers)
     bands = {n: [int(x) for x in part] for n, part in zip(names, np.array_split(eligible, n_bands))}
@@ -674,16 +734,50 @@ def null_draws(blocks: List[Tuple[List[int], int]], n_draws: int,
     return draws, size, False
 
 
-def build_policy_specs(num_layers: int, regime: Regime, criteria: pd.DataFrame,
-                       cfg: ExperimentConfig) -> List[PolicySpec]:
+def random_pair_maps(eligible: Sequence[int], k: int, n_draws: int,
+                     rng: np.random.Generator) -> Tuple[List[Dict[int, int]], int, bool]:
+    """
+    Null space of the KVSharer-search families: every chain-free live map with k
+    targets in `eligible` (all >= 1) whose sources are earlier non-target layers.
+    For targets t_1 < ... < t_k there are prod_j (t_j - j) source assignments
+    (layers below t_j minus the j targets below it), so target sets are drawn with
+    that weight and sources uniformly: every map is equally likely, and a searched
+    map is a member of the space (exchangeable under H0).
+    """
+    if math.comb(len(eligible), k) > 5_000_000:
+        raise ValueError(f"random-pair null space too large to weight exactly (C({len(eligible)},{k}))")
+    combos = np.array(list(itertools.combinations(sorted(eligible), k)), dtype=np.int64)
+    weights = np.prod(combos - np.arange(k)[None, :], axis=1)
+    size = int(weights.sum())
+
+    def sources(tset):
+        return {t: [x for x in range(t) if x not in tset] for t in tset}
+
+    if size <= n_draws:
+        maps = [dict(zip(row, choice)) for row in combos.tolist()
+                for choice in itertools.product(*sources(set(row)).values())]
+        return [maps[i] for i in rng.permutation(len(maps))], size, True
+    rows = rng.choice(len(combos), size=n_draws, p=weights / weights.sum())
+    maps = []
+    for r in rows:
+        tset = [int(t) for t in combos[r]]
+        maps.append({t: int(rng.choice(src)) for t, src in sources(set(tset)).items()})
+    return maps, size, False
+
+
+def build_policy_specs(num_layers: int, regime: Regime, criteria: pd.DataFrame, cfg: ExperimentConfig,
+                       searched: Optional[Dict[str, Dict[int, int]]] = None) -> List[PolicySpec]:
     """
     All runs of one (model, regime).  Non-primary regimes run `full` only.  In the
     primary regime, `criteria` has one row per target of the `full` map with
-    columns target, source, cka, kvsharer_distance, attn_out_rel_err.
-    Tiers: deterministic policies at the primary k (and `full` / counterfactuals)
-    get every readout; gated policies at other k and all null draws (randomisation
-    and dose-response) get the frozen readout on test items only.  Deterministic
-    runs and the first N_AUX_DRAWS draws of every null family also get the
+    columns target, source, cka, kvsharer_distance, attn_out_rel_err, and
+    `searched` holds the KVSharer-search maps (family -> source map).
+    Tiers: deterministic policies at the primary k (and `full`, counterfactuals,
+    KVSharer-search maps) get frozen + retrained readouts; gated policies at other
+    k and all null draws get the frozen readout on test items only.  Null families
+    used by decision rules (depth-matched, uniform, random-pair) are drawn at the
+    primary k; the uniform family is also drawn at the other k (dose-response).
+    Deterministic runs and the first N_AUX_DRAWS draws of every null family get the
     behavioural readout; those of the uniform and random-source families also get
     the generative evaluation (points for H6 / H8c).
     """
@@ -711,34 +805,46 @@ def build_policy_specs(num_layers: int, regime: Regime, criteria: pd.DataFrame,
     score = {fam: sign * crit[col] for fam, (col, sign) in GATE_CRITERIA.items()}
     bins = [set(int(x) for x in b) for b in np.array_split(np.arange(ec, L), cfg.DEPTH_BINS)]
 
-    def add_nulls(family, blocks, k, assign, seed_key):
-        draws, size, exhaustive = null_draws(blocks, R, _rng(seed_key, L, regime.name, k))
-        for d, chosen in enumerate(draws, 1):
+    def add_nulls(family, k, draws, size, exhaustive):
+        for d, smap in enumerate(draws, 1):
             aux = d <= cfg.N_AUX_DRAWS
-            specs.append(spec(f"{family}@k{k}#{d}", family, assign(chosen), draw=d, tier="frozen",
+            specs.append(spec(f"{family}@k{k}#{d}", family, smap, draw=d, tier="frozen",
                               behavioral=aux, downstream=aux and family in (UNIFORM, RANDOM_SOURCE),
                               size=size, exhaustive=exhaustive))
 
-    def restrict(chosen):
-        return {t: full_map[t] for t in sorted(chosen)}
+    def restricted_nulls(family, blocks, k, seed_key):
+        draws, size, exhaustive = null_draws(blocks, R, _rng(seed_key, L, regime.name, k))
+        add_nulls(family, k, [{t: full_map[t] for t in sorted(c)} for c in draws], size, exhaustive)
 
     for k in ks:
-        tier = "full" if k == k0 else "frozen"
         for fam in cfg.GATED_FAMILIES:
             ranked = score[fam].sort_values(ascending=False, kind="mergesort")
             sel = sorted(int(t) for t in ranked.index[:k])
-            specs.append(spec(f"{fam}@k{k}", fam, restrict(sel), tier=tier))
-            blocks = [(sorted(set(targets) & b), len(set(sel) & b)) for b in bins]
-            add_nulls(DEPTH_PREFIX + fam, [bk for bk in blocks if bk[1]], k, restrict,
-                      ("depth_matched", fam))
-        add_nulls(UNIFORM, [(targets, k)], k, restrict, (UNIFORM,))
+            specs.append(spec(f"{fam}@k{k}", fam, {t: full_map[t] for t in sel},
+                              tier="full" if k == k0 else "frozen"))
+            if k == k0:
+                blocks = [(sorted(set(targets) & b), len(set(sel) & b)) for b in bins]
+                restricted_nulls(DEPTH_PREFIX + fam, [bk for bk in blocks if bk[1]], k, ("depth_matched", fam))
+        restricted_nulls(UNIFORM, [(targets, k)], k, (UNIFORM,))
 
-    # H4 null: every target reads a uniformly random earlier cached layer (own head included,
-    # so `full` is a member of its null space).
-    cached = [li for li in range(L) if li not in full_map]
-    blocks = [([c for c in cached if c < t], 1) for t in targets]
-    add_nulls(RANDOM_SOURCE, blocks, len(targets), lambda chosen: dict(zip(targets, chosen)),
-              (RANDOM_SOURCE,))
+    # H4 null (sanity check): every target reads a uniformly random cached layer of the
+    # eligible range below it (own head included, so `full` is a member of the null).
+    # Exempt layers are excluded: reading layer 0..ec-1 is a different, near-certainly
+    # catastrophic perturbation that would make the test trivially significant.
+    cached = [li for li in range(ec, L) if li not in full_map]
+    draws, size, exhaustive = null_draws([([c for c in cached if c < t], 1) for t in targets], R,
+                                         _rng(RANDOM_SOURCE, L, regime.name))
+    add_nulls(RANDOM_SOURCE, len(targets), [dict(zip(targets, c)) for c in draws], size, exhaustive)
+
+    # KVSharer search maps (all layer pairs, greedy, output-similarity acceptance) and
+    # their null: uniformly random chain-free maps with the same number of targets.
+    for fam, smap in (searched or {}).items():
+        if smap:
+            specs.append(spec(f"{fam}@k{len(smap)}", fam, smap))
+    eligible = list(range(max(ec, 1), L))
+    for k in sorted({len(m) for m in (searched or {}).values() if m}):
+        draws, size, exhaustive = random_pair_maps(eligible, k, R, _rng(RANDOM_PAIRS, L, regime.name, k))
+        add_nulls(RANDOM_PAIRS, k, draws, size, exhaustive)
 
     if cfg.COUNTERFACTUAL_ENABLED:
         heads = sorted(set(gm.values()))
@@ -746,8 +852,8 @@ def build_policy_specs(num_layers: int, regime: Regime, criteria: pd.DataFrame,
         cf_targets = [t for t in targets if nxt[t] is not None]
         if cf_targets:
             if cf_targets != targets:
-                specs.append(spec(LIVE_PREV, LIVE_PREV, restrict(cf_targets), downstream=False))
-            specs.append(spec(CF_PREV, CF_PREV, restrict(cf_targets), semantics="clean"))
+                specs.append(spec(LIVE_PREV, LIVE_PREV, {t: full_map[t] for t in cf_targets}, downstream=False))
+            specs.append(spec(CF_PREV, CF_PREV, {t: full_map[t] for t in cf_targets}, semantics="clean"))
             specs.append(spec(CF_NEXT, CF_NEXT, {t: nxt[t] for t in cf_targets}, semantics="clean"))
     return specs
 
@@ -841,12 +947,12 @@ def tokenizer_validity(cfg: ExperimentConfig, stimuli: Sequence[str]) -> Tuple[n
     valid = np.ones(len(stimuli), bool)
     report = []
     task = cfg.task_template()
-    for mc in cfg.MODELS:
-        tok = AutoTokenizer.from_pretrained(mc.model_id)
+    for model_id in cfg.ITEM_FILTER_MODEL_IDS:
+        tok = AutoTokenizer.from_pretrained(model_id)
         bos = bos_prefix(tok)
         ok = ((encode(tok, cfg.STIMULUS_TEMPLATE, stimuli, bos).n_tokens >= 1)
               & (encode(tok, task, stimuli, bos).n_tokens >= 1))
-        report.append({"model": mc.name, "n_strings": len(stimuli), "n_excluded": int((~ok).sum())})
+        report.append({"model_id": model_id, "n_strings": len(stimuli), "n_excluded": int((~ok).sum())})
         valid &= ok
     return valid, pd.DataFrame(report)
 
@@ -1155,17 +1261,26 @@ class ModelRunner:
         return nonfinite, logits
 
     @torch.no_grad()
-    def behavior_pass(self, item_idx: np.ndarray, spec: Optional[PolicySpec]) -> np.ndarray:
-        """Behavioural lexical-decision score logit(Yes) - logit(No) per item (task prompt)."""
+    def behavior_pass(self, item_idx: np.ndarray, spec: Optional[PolicySpec]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Behavioural lexical decision per item (task prompt): the score
+        logit(Yes) - logit(No) and the probability mass on the two answer tokens.
+        The mass shows whether the policy preserved the answer format at all; a
+        score change without retained mass is loss of the task format, not of
+        lexical knowledge.
+        """
         out = np.full(len(item_idx), np.nan, np.float32)
+        mass = np.full(len(item_idx), np.nan, np.float32)
         yes, no = self.answer_ids
 
         def step(pos, ids):
             lg = self.forward(ids, spec).logits[:, -1].float()
+            lp = lg.log_softmax(-1)
             out[pos] = (lg[:, yes] - lg[:, no]).cpu().numpy()
+            mass[pos] = (lp[:, yes].exp() + lp[:, no].exp()).cpu().numpy()
 
         self.run_batches(self.task, item_idx, step)
-        return out
+        return out, mass
 
     @torch.no_grad()
     def stimulus_logprob(self, item_idx: np.ndarray) -> np.ndarray:
@@ -1204,7 +1319,7 @@ class ModelRunner:
 
     # ── Calibration of partner criteria ───────────────────────────────
     @torch.no_grad()
-    def calibrate(self, item_idx: np.ndarray, pairs: Dict[int, int]) -> Tuple[pd.DataFrame, Dict]:
+    def calibrate(self, item_idx: np.ndarray, pairs: Dict[int, int]) -> Tuple[pd.DataFrame, Dict, np.ndarray]:
         """
         Per (target, source) pair of the primary `full` map, on a clean pass over
         stimulus-token rows of calibration (train) items:
@@ -1214,7 +1329,8 @@ class ModelRunner:
           rel_kv_distance     row-wise ||[K_s;V_s]-[K_t;V_t]|| / ||[K_t;V_t]|| (diagnostic)
           attn_out_rel_err    sqrt(sum err / sum own), the query-aware residual-stream error
         plus item-level split-half reliability of every criterion's pair ranking and
-        rank agreement between criteria.
+        rank agreement between criteria.  Also returns the layer-averaged flattened
+        [K; V] of every layer (L, 2 * kv_dim) for the KVSharer search.
         """
         meter = CriterionMeter(pairs)
         row_item: List[int] = []
@@ -1235,6 +1351,7 @@ class ModelRunner:
         self.run_batches(self.carrier, item_idx, step)
         cat = {name: {li: torch.cat(v) for li, v in d.items()} for name, d in meter.rows.items()}
         row_item = np.asarray(row_item)
+        layer_means = torch.stack([cat["kv_sum"][li].sum(0) for li in range(self.L)]).double() / len(row_item)
         rng = np.random.default_rng(SEED)
         uniq = rng.permutation(np.unique(row_item))
         in_a = np.isin(row_item, uniq[: len(uniq) // 2])
@@ -1284,7 +1401,50 @@ class ModelRunner:
             for i, a in enumerate(names):
                 for b in names[i + 1:]:
                     summary[f"kendall_{a}_vs_{b}"] = float(stats.kendalltau(crit[a], crit[b])[0])
-        return df, summary
+        return df, summary, layer_means.numpy()
+
+    @torch.no_grad()
+    def final_states(self, item_idx: np.ndarray, source_map: Dict[int, int]) -> torch.Tensor:
+        """Final-layer last-token states (n, H) under a live substitution map."""
+        spec = PolicySpec("trial", "trial", source_map, "live", True, self.L) if source_map else None
+        store = {self.L - 1: torch.empty((int(item_idx.max()) + 1, self.H), dtype=self.store_dtype)}
+        self.states_pass(item_idx, spec, [self.L - 1], store)
+        return store[self.L - 1][torch.as_tensor(item_idx)].float()
+
+    @torch.no_grad()
+    def kvsharer_search(self, item_idx: np.ndarray, layer_means: np.ndarray, ec: int, k: int,
+                        dissimilar: bool, threshold: float) -> Tuple[Dict[int, int], pd.DataFrame]:
+        """
+        KVSharer-style search (Yang et al., 2024) over ALL layer pairs s < t with t
+        eligible: pairs are ranked by the Euclidean distance between layer-averaged
+        flattened K/V (descending = KVSharer's dissimilar preference; ascending = the
+        similar control); a pair is tried if it keeps the map chain-free (t not yet a
+        target or source, s not a target) and accepted if the mean cosine similarity
+        of final-layer states with vs without the tentative map, on calibration items,
+        is >= threshold.  The search stops at k targets (rate-matched to the gated
+        policies); a shortfall is logged and reported.
+        """
+        base = self.final_states(item_idx, {})
+        dist = {(t, s): float(np.linalg.norm(layer_means[t] - layer_means[s]))
+                for t in range(max(ec, 1), self.L) for s in range(t)}
+        order = sorted(dist, key=lambda p: ((-dist[p] if dissimilar else dist[p]), p))
+        smap, log = {}, []
+        for t, s in order:
+            if len(smap) == k:
+                break
+            if t in smap or t in smap.values() or s in smap:
+                continue
+            trial = {**smap, t: s}
+            cos = float(F.cosine_similarity(self.final_states(item_idx, trial), base, dim=-1).mean())
+            accepted = cos >= threshold
+            log.append({"target": t, "source": s, "distance": dist[(t, s)], "final_cosine": cos,
+                        "accepted": accepted, "n_targets_after": len(trial) if accepted else len(smap)})
+            if accepted:
+                smap = trial
+        if len(smap) < k:
+            logger.warning(f"  KVSharer search ({'dissimilar' if dissimilar else 'similar'}) accepted only "
+                           f"{len(smap)}/{k} targets at threshold {threshold}")
+        return smap, pd.DataFrame(log)
 
     # ── Mechanistic diagnostics ───────────────────────────────────────
     @torch.no_grad()
@@ -1480,6 +1640,24 @@ def online_codelength(X: torch.Tensor, y: torch.Tensor, lam: float,
 # PER-MODEL PIPELINE
 # ════════════════════════════════════════════════════════════════════════════
 
+class MemmapLayer:
+    """One layer's states for all items on disk; 16-bit floats are stored bit-exactly as int16."""
+
+    def __init__(self, path: str, n: int, H: int, dtype: torch.dtype):
+        self.dtype = dtype
+        self.half = torch.empty((), dtype=dtype).element_size() == 2
+        self.arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.int16 if self.half else np.float32,
+                                             shape=(n, H))
+
+    def __setitem__(self, rows, h: torch.Tensor):
+        h = h.contiguous()
+        self.arr[np.asarray(rows)] = (h.view(torch.int16) if self.half else h.float()).numpy()
+
+    def to(self, device, dtype) -> torch.Tensor:
+        t = torch.from_numpy(np.array(self.arr))
+        return (t.view(self.dtype) if self.half else t).to(device, dtype)
+
+
 class ModelPipeline:
     """
     Order per model:
@@ -1548,9 +1726,22 @@ class ModelPipeline:
             DownstreamEvaluator(self.cfg, self.runner).run(downstream, self.run_path(None, "downstream", "csv"))
         self.runner.release()
 
-    def _alloc(self) -> Dict[int, torch.Tensor]:
-        return {li: torch.empty((len(self.items), self.H), dtype=self.runner.store_dtype)
-                for li in range(self.L)}
+    def _alloc(self, run: str) -> Dict[int, object]:
+        """All-item states of every layer, in RAM or in memory-mapped files (STATE_STORE)."""
+        n, dt = len(self.items), self.runner.store_dtype
+        if self.cfg.STATE_STORE == "memory":
+            return {li: torch.empty((n, self.H), dtype=dt) for li in range(self.L)}
+        d = self._state_dir(run)
+        os.makedirs(d, exist_ok=True)
+        return {li: MemmapLayer(os.path.join(d, f"layer{li}.npy"), n, self.H, dt) for li in range(self.L)}
+
+    def _state_dir(self, run: str) -> str:
+        root = self.cfg.STATE_DIR or os.path.join(self.cfg.OUTPUT_DIR, "state_cache")
+        return os.path.join(root, safe_name(self.mc.name), safe_name(run))
+
+    def _release_states(self, run: str):
+        if self.cfg.STATE_STORE == "disk":
+            shutil.rmtree(self._state_dir(run), ignore_errors=True)
 
     def _nonfinite_mask(self, nonfinite: Dict[int, int], n: int) -> np.ndarray:
         return np.array([nonfinite[li] / n > self.cfg.NONFINITE_MAX_FRACTION for li in range(self.L)])
@@ -1563,19 +1754,20 @@ class ModelPipeline:
             return ProbeBank.load(bank_path)
         spec = no_reuse_spec(self.L)
         t0 = time.time()
-        store = self._alloc()
+        store = self._alloc(NO_REUSE)
         nf_test, _ = self.runner.states_pass(self.test, spec, range(self.L), store)
         nf_rest, _ = self.runner.states_pass(self.nontest, spec, range(self.L), store)
         nonfinite = {li: nf_test[li] + nf_rest[li] for li in range(self.L)}
         bank = ProbeBank.empty(len(self.cfg.PROBE_SEEDS), self.L, self.H)
         rt, auc_seed = self._retrained(store, nonfinite, spec, None, bank)
+        self._release_states(NO_REUSE)
         frozen = FrozenReadout(bank)
         _, fz = self.runner.states_pass(self.test, spec, range(self.L), frozen=frozen)
-        beh = self.runner.behavior_pass(self.test, spec)
+        beh, mass = self.runner.behavior_pass(self.test, spec)
         self._static_baseline()
         bank.save(bank_path)
         self._save_run(None, spec, time.time() - t0, nonfinite, frozen=fz, retrained=rt,
-                       auc_seed=auc_seed, behavior=beh)
+                       auc_seed=auc_seed, behavior=beh, behavior_mass=mass)
         return bank
 
     def _retrained(self, store, nonfinite, spec: PolicySpec, regime: Optional[Regime],
@@ -1634,23 +1826,50 @@ class ModelPipeline:
         ec = exempt_cutoff(self.L, regime.exempt_fraction)
         full_map = {t: s for t, s in group_heads(self.L, regime.reuse_factor, ec).items() if t != s}
         crit = pd.DataFrame(columns=["target", "source", "cka", "kvsharer_distance", "attn_out_rel_err"])
+        searched = {}
         if regime.role == "primary" and full_map:
+            s0 = self.cfg.PROBE_SEEDS[0]
+            calib_idx = np.sort(np.random.default_rng(SEED).choice(
+                self.splits.train[s0], size=min(self.cfg.CALIB_N_ITEMS, len(self.splits.train[s0])),
+                replace=False))
             crit_path = self.run_path(regime.name, "calibration", "csv")
-            if self.cfg.RESUME and os.path.exists(crit_path):
-                crit = pd.read_csv(crit_path)
+            means_path = self.run_path(regime.name, "layer_kv_means", "npy")
+            if self.cfg.RESUME and os.path.exists(crit_path) and os.path.exists(means_path):
+                crit, means = pd.read_csv(crit_path), np.load(means_path)
             else:
-                s0 = self.cfg.PROBE_SEEDS[0]
-                calib_idx = np.sort(np.random.default_rng(SEED).choice(
-                    self.splits.train[s0], size=min(self.cfg.CALIB_N_ITEMS, len(self.splits.train[s0])),
-                    replace=False))
-                crit, summary = self.runner.calibrate(calib_idx, full_map)
+                crit, summary, means = self.runner.calibrate(calib_idx, full_map)
                 crit.to_csv(crit_path, index=False)
+                np.save(means_path, means)
                 with open(self.run_path(regime.name, "calibration_summary", "json"), "w") as f:
                     json.dump(summary, f, indent=2)
                 logger.info(f"  [calib {regime.name}] {summary}")
-        specs = build_policy_specs(self.L, regime, crit, self.cfg)
+            searched = self._kvsharer_maps(regime, ec, len(full_map), calib_idx, means)
+        specs = build_policy_specs(self.L, regime, crit, self.cfg, searched)
         self._check_distinct(regime, specs)
         return specs
+
+    def _kvsharer_maps(self, regime: Regime, ec: int, n_targets: int, calib_idx: np.ndarray,
+                       means: np.ndarray) -> Dict[str, Dict[int, int]]:
+        """KVSharer search maps (dissimilar = KVSharer, similar = control), rate-matched to k0."""
+        if n_targets < 3:
+            return {}
+        path = self.run_path(regime.name, "kvsharer_search", "json")
+        if self.cfg.RESUME and os.path.exists(path):
+            with open(path) as f:
+                return {fam: {int(t): int(v) for t, v in m.items()} for fam, m in json.load(f).items()}
+        _, k0 = gate_sizes(n_targets, self.cfg)
+        check_idx = calib_idx[: self.cfg.KVSHARER_CHECK_ITEMS]
+        maps, logs = {}, []
+        for fam in KVSHARER_FAMILIES:
+            smap, log = self.runner.kvsharer_search(check_idx, means, ec, k0, fam == "kvsharer_dissimilar",
+                                                    self.cfg.KVSHARER_COS_THRESHOLD)
+            maps[fam] = smap
+            logs.append(log.assign(family=fam, requested_k=k0))
+        pd.concat(logs, ignore_index=True).to_csv(self.run_path(regime.name, "kvsharer_search_log", "csv"),
+                                                  index=False)
+        with open(path, "w") as f:
+            json.dump({fam: {str(t): v for t, v in m.items()} for fam, m in maps.items()}, f, indent=2)
+        return maps
 
     @staticmethod
     def _check_distinct(regime: Regime, specs: List[PolicySpec]):
@@ -1680,18 +1899,20 @@ class ModelPipeline:
         t0 = time.time()
         arrays = {}
         if spec.tier == "full":
-            store = self._alloc()
+            run = f"{regime.name}_{spec.name}"
+            store = self._alloc(run)
             nf_test, fz = self.runner.states_pass(self.test, spec, range(self.L), store, frozen)
             nf_rest, _ = self.runner.states_pass(self.nontest, spec, range(self.L), store)
             nonfinite = {li: nf_test[li] + nf_rest[li] for li in range(self.L)}
             arrays["retrained"], arrays["auc_seed"] = self._retrained(store, nonfinite, spec, regime)
+            self._release_states(run)
         else:
             nf_test, fz = self.runner.states_pass(self.test, spec, range(self.L), frozen=frozen)
             nonfinite = nf_test
         fz[self._nonfinite_mask(nf_test, len(self.test))] = np.nan
         arrays["frozen"] = fz
         if spec.behavioral:
-            arrays["behavior"] = self.runner.behavior_pass(self.test, spec)
+            arrays["behavior"], arrays["behavior_mass"] = self.runner.behavior_pass(self.test, spec)
         self._save_run(regime.name, spec, time.time() - t0, nonfinite, **arrays)
         if spec.tier == "full" and spec.draw == 0 and self.cfg.MECH_N_ITEMS > 0:
             self.runner.mechanistic(self.test[: self.cfg.MECH_N_ITEMS], spec).assign(
@@ -1772,15 +1993,17 @@ class ModelPipeline:
         readouts = sorted({peak, self.L - 1})
         out = np.full((self.L, len(readouts), len(self.test)), np.nan, np.float32)
         beh = np.full((self.L, len(self.test)), np.nan, np.float32)
+        mass = np.full((self.L, len(self.test)), np.nan, np.float32)
         mismatch = np.zeros(self.L, bool)
         for t in tqdm(range(1, self.L), desc=f"fragility {self.mc.name}"):
             spec = single_layer_spec(self.L, t)
             _, out[t] = self.runner.states_pass(self.test, spec, readouts, frozen=frozen)
-            beh[t] = self.runner.behavior_pass(self.test, spec)
+            beh[t], mass[t] = self.runner.behavior_pass(self.test, spec)
             mismatch[t] = self.runner.rope_mismatch(spec.source_map) > 0
         np.savez_compressed(path, test_items=self.test, readouts=np.array(readouts),
                             base_logits=base["frozen"][readouts], logits=out,
-                            base_behavior=base["behavior"], behavior=beh, rope_mismatch=mismatch)
+                            base_behavior=base["behavior"], behavior=beh, base_behavior_mass=base["behavior_mass"],
+                            behavior_mass=mass, rope_mismatch=mismatch)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2034,9 +2257,10 @@ def zscore(x: np.ndarray) -> np.ndarray:
 DETERMINISTIC_CONTRASTS = [
     # (label, policy A, policy B); A and B are deterministic runs at the primary k
     ("H3a_cka_similar_vs_dissimilar", "cka_high", "cka_low"),
-    ("H3a_kvsharer_similar_vs_dissimilar", "kvdist_low", "kvdist_high"),
+    ("H3a_kvdist_within_cla_similar_vs_dissimilar", "kvdist_low", "kvdist_high"),
+    ("H3a_kvsharer_search_similar_vs_dissimilar", "kvsharer_similar", "kvsharer_dissimilar"),
     ("H3c_fidelity_vs_cka", "fidelity_high", "cka_high"),
-    ("H3c_fidelity_vs_kvsharer", "fidelity_high", "kvdist_high"),
+    ("H3c_fidelity_vs_kvdist_within_cla", "fidelity_high", "kvdist_high"),
     ("C1_live_vs_clean_semantics", LIVE_PREV, CF_PREV),
     ("C2_previous_vs_next_head_source", CF_PREV, CF_NEXT),
 ]
@@ -2225,6 +2449,13 @@ class ModelAnalysis:
         """AUC, or Cohen's d when no_reuse is at ceiling on these layers (C1)."""
         return "d_all" if self.base_auc(readout, layers) >= self.cfg.CEILING_AUC else "auc_all"
 
+    def mass_ratio(self, key: Tuple) -> float:
+        """Median answer-token mass under the policy / under no_reuse (task-format retention)."""
+        arr = self.arrays(key)
+        if "behavior_mass" not in arr:
+            return np.nan
+        return float(np.nanmedian(arr["behavior_mass"]) / np.nanmedian(self.arrays(self.base)["behavior_mass"]))
+
     def readouts_of(self, key: Tuple) -> List[str]:
         return [r for r in READOUTS if r in self.arrays(key)]
 
@@ -2314,14 +2545,20 @@ class ModelAnalysis:
     def behavior_table(self) -> pd.DataFrame:
         if "behavior" not in self.arrays(self.base):
             return pd.DataFrame()
+        base_mass = float(np.nanmedian(self.arrays(self.base)["behavior_mass"]))
         rows = [{"model": self.model, "regime": CONTROL, "policy": NO_REUSE, "family": NO_REUSE,
-                 "metric": "abs_auc_all", **summarize(self.curve(self.base, "behavior", "auc_all")[0])}]
+                 "metric": "abs_auc_all", "answer_mass_median": base_mass, "answer_mass_ratio": 1.0,
+                 "format_retained": True, **summarize(self.curve(self.base, "behavior", "auc_all")[0])}]
         for key in [k for k in self.keys() if self.is_boot(k) and "behavior" in self.arrays(k)]:
+            ratio = self.mass_ratio(key)
             for metric in ("auc_all", "d_all", "auc_hf", "auc_lf", "auc_lf_hard", "sel_auc"):
                 if metric.endswith("lf_hard") and not self.wordlike.any():
                     continue
                 rows.append({"model": self.model, "regime": key[0], "policy": key[1],
                              "family": self.meta[key]["family"], "metric": metric,
+                             "answer_mass_median": float(np.nanmedian(self.arrays(key)["behavior_mass"])),
+                             "answer_mass_ratio": ratio,
+                             "format_retained": ratio >= self.cfg.BEHAVIOR_MASS_MIN_RATIO,
                              **summarize(self.delta(key, "behavior", metric, [0]))})
         df = pd.DataFrame(rows)
         pol = df[df.metric != "abs_auc_all"].copy()
@@ -2352,12 +2589,14 @@ class ModelAnalysis:
                        "kv_memory_fraction": meta["kv_memory_fraction"],
                        "mean_source_distance": meta["mean_source_distance"],
                        "null_space_size": meta["null_space_size"], "exhaustive": meta["exhaustive"],
-                       "rope_mismatch": meta["rope_mismatch"], "band": band, "primary_metric": prim,
+                       "rope_mismatch": meta["rope_mismatch"], "seconds": meta["seconds"],
+                       "band": band, "primary_metric": prim,
                        "delta_auc_all": self.delta(key, "frozen", "auc_all", layers, boot=False)[0],
                        "delta_d_all": self.delta(key, "frozen", "d_all", layers, boot=False)[0],
                        "policy_auc_all": float(np.nanmean(self.curve(key, "frozen", "auc_all", False)[layers, 0])),
                        "delta_behavior_auc": (self.delta(key, "behavior", "auc_all", [0], boot=False)[0]
                                               if beh else np.nan),
+                       "answer_mass_ratio": self.mass_ratio(key) if beh else np.nan,
                        "neg_control_layers": first, "neg_control_max_abs_logit": neg,
                        "neg_control_pass": bool(not np.isfinite(neg) or neg <= self.cfg.NEG_CONTROL_ATOL)}
                 row["delta_primary"] = row["delta_d_all"] if prim == "d_all" else row["delta_auc_all"]
@@ -2381,9 +2620,13 @@ class ModelAnalysis:
         tests += [(f"H3d_{fam}_vs_uniform", f"{fam}@k{k}", UNIFORM, k) for k in ks for fam in gated]
         n_full = int(e.k[e.family == FULL].max()) if (e.family == FULL).any() else None
         tests += [("H4_own_head_vs_random_source", FULL, RANDOM_SOURCE, n_full)]
+        for fam in KVSHARER_FAMILIES:
+            det = e[(e.family == fam) & (e.draw == 0)]
+            if len(det):
+                tests.append((f"H3e_{fam}_vs_random_pairs", det.policy.iloc[0], RANDOM_PAIRS, int(det.k.iloc[0])))
         rows, support = [], []
         for label, obs_name, null_family, k in tests:
-            primary = k == self.k0 or label.startswith("H4")
+            primary = k == self.k0 or label.startswith(("H4", "H3e"))
             for band, g in e.groupby("band"):
                 obs = g[g.policy == obs_name]
                 null = g[(g.family == null_family) & (g.k == k)]
@@ -2408,6 +2651,7 @@ class ModelAnalysis:
         if self.k0 is None:
             return pd.DataFrame()
         names = {fam: (P, f"{fam}@k{self.k0}") for fam in self.cfg.GATED_FAMILIES}
+        names |= {fam: keys[0] for fam in KVSHARER_FAMILIES if (keys := self.keys(P, fam, deterministic=True))}
         names |= {LIVE_PREV: (P, LIVE_PREV) if (P, LIVE_PREV) in self.meta else (P, FULL),
                   CF_PREV: (P, CF_PREV), CF_NEXT: (P, CF_NEXT)}
         rows = []
@@ -2443,12 +2687,21 @@ class ModelAnalysis:
 
     def item_regressions(self) -> pd.DataFrame:
         """
-        Damage = baseline evidence - policy evidence (words).  ANCOVA (primary):
-        damage ~ e_base + e_base^2 + frequency + length/OrthoN/BG + n_tokens (HC3);
-        conditioning on baseline evidence removes the confound that strong (high
-        frequency) items lose more under proportional damage (Senn, 2006).  The
-        change-score model (no baseline term) is reported for comparison.
-        beta_freq < 0  <=>  lower-frequency words are damaged more.
+        Word damage = baseline evidence - policy evidence (no_reuse pooled-SD units).
+        Estimands (Lord, 1967; Pearl, 2001), beta_freq < 0  <=>  rarer words lose more:
+          primary   change score  damage ~ freq + length/OrthoN/BG + n_tokens (HC3).
+                    Frequency effect on damage not routed through tokenisation; NO
+                    baseline-evidence term, because frequency causes baseline
+                    evidence (a mediator, not a confounder: frequency is not
+                    randomised).  Assumes no unmeasured common cause of n_tokens
+                    and damage beyond the orthographic covariates.
+          total     same without n_tokens (also the attenuation reference).
+          relative  damage / baseline evidence (scale-free, proportional loss) for
+                    words with baseline evidence >= RELATIVE_DAMAGE_MIN_BASE; the
+                    restriction selects on a mediator, so it is descriptive only.
+          direct    ANCOVA adding e_base and e_base^2: the effect at equal baseline
+                    evidence.  Valid only if no item property (e.g. embedding norm,
+                    anisotropy) affects both baseline evidence and damage.
         """
         words = self.word_mask()
         T = self.t[words]
@@ -2472,31 +2725,35 @@ class ModelAnalysis:
                     if not (np.isfinite(dmg).all() and np.isfinite(e_base).all()) or not np.any(dmg):
                         continue          # band entirely before the first target: damage is exactly 0
                     eb = e_base - e_base.mean()
+                    strong = e_base >= self.cfg.RELATIVE_DAMAGE_MIN_BASE
                     for fname, fz in freq.items():
                         base_X = pd.DataFrame({"freq_z": fz} | covs)
-                        X_anc = base_X.assign(e_base_c=eb, e_base_c2=eb ** 2, n_tokens_c=ntok_c)
-                        m_anc = ols_hc3(dmg, X_anc)
-                        m_anc0 = ols_hc3(dmg, base_X.assign(e_base_c=eb, e_base_c2=eb ** 2))
-                        m_chg = ols_hc3(dmg, base_X.assign(n_tokens_c=ntok_c))
-                        vif = max(variance_inflation_factor(sm.add_constant(X_anc).to_numpy(), i)
-                                  for i in range(1, X_anc.shape[1] + 1))
-                        b_no, b_yes = m_anc0.params["freq_z"], m_anc.params["freq_z"]
-                        ci = m_anc.conf_int().loc["freq_z"]
-                        rows.append({"model": self.model, "family_model": self.family, "regime": regime,
-                                     "family": label, "readout": ro, "band": band, "freq_measure": fname,
-                                     "n_words": int(words.sum()), "mean_damage": float(dmg.mean()),
-                                     "policy_auc_all": pol_auc, "at_floor": pol_auc <= self.cfg.FLOOR_AUC,
-                                     "beta_freq": b_yes, "se_freq": m_anc.bse["freq_z"],
-                                     "ci_freq_low": ci.iloc[0], "ci_freq_high": ci.iloc[1],
-                                     "p_freq": m_anc.pvalues["freq_z"],
-                                     "beta_ntok": m_anc.params["n_tokens_c"], "p_ntok": m_anc.pvalues["n_tokens_c"],
-                                     "beta_freq_no_ntok": b_no,
-                                     "attenuation_by_ntok": (1 - b_yes / b_no) if b_no != 0 else np.nan,
-                                     "beta_freq_change_score": m_chg.params["freq_z"],
-                                     "p_freq_change_score": m_chg.pvalues["freq_z"],
-                                     "beta_ntok_change_score": m_chg.params["n_tokens_c"],
-                                     "p_ntok_change_score": m_chg.pvalues["n_tokens_c"],
-                                     "max_vif": float(vif), "covariates": ";".join(self.covariates)})
+                        X_cs = base_X.assign(n_tokens_c=ntok_c)
+                        m_cs = ols_hc3(dmg, X_cs)
+                        m_tot = ols_hc3(dmg, base_X)
+                        m_dir = ols_hc3(dmg, X_cs.assign(e_base_c=eb, e_base_c2=eb ** 2))
+                        vif = max(variance_inflation_factor(sm.add_constant(X_cs).to_numpy(), i)
+                                  for i in range(1, X_cs.shape[1] + 1))
+                        b_cs, b_tot = m_cs.params["freq_z"], m_tot.params["freq_z"]
+                        ci = m_cs.conf_int().loc["freq_z"]
+                        row = {"model": self.model, "family_model": self.family, "regime": regime,
+                               "family": label, "readout": ro, "band": band, "freq_measure": fname,
+                               "n_words": int(words.sum()), "mean_damage": float(dmg.mean()),
+                               "policy_auc_all": pol_auc, "at_floor": pol_auc <= self.cfg.FLOOR_AUC,
+                               "beta_freq": b_cs, "se_freq": m_cs.bse["freq_z"],
+                               "ci_freq_low": ci.iloc[0], "ci_freq_high": ci.iloc[1], "p_freq": m_cs.pvalues["freq_z"],
+                               "beta_ntok": m_cs.params["n_tokens_c"], "p_ntok": m_cs.pvalues["n_tokens_c"],
+                               "beta_freq_total": b_tot, "p_freq_total": m_tot.pvalues["freq_z"],
+                               "attenuation_by_ntok": (1 - b_cs / b_tot) if b_tot != 0 else np.nan,
+                               "beta_freq_direct": m_dir.params["freq_z"], "p_freq_direct": m_dir.pvalues["freq_z"],
+                               "max_vif": float(vif), "covariates": ";".join(self.covariates),
+                               "n_words_relative": int(strong.sum())}
+                        if strong.sum() > X_cs.shape[1] + 2:
+                            m_rel = ols_hc3(dmg[strong] / e_base[strong],
+                                            X_cs[strong].assign(freq_z=zscore(fz[strong])))
+                            row |= {"beta_freq_relative": m_rel.params["freq_z"],
+                                    "p_freq_relative": m_rel.pvalues["freq_z"]}
+                        rows.append(row)
         return pd.DataFrame(rows)
 
     # ── 8. token-count strata ─────────────────────────────────────────
@@ -2521,9 +2778,11 @@ class ModelAnalysis:
         """
         HF/LF words optimally matched (Hungarian) within n_token strata on length,
         OrthoN and bigram frequency (caliper per covariate), never on human accuracy.
-        H7a: base evidence HF - LF.  H7b: selectivity = damage(LF) - damage(HF)
-        (> 0: LF damaged more), sign-flip permutation test; the baseline-adjusted
-        selectivity (OLS intercept at equal baseline evidence, HC3) is reported.
+        H7a: base evidence HF - LF.  H7b (total effect, primary): selectivity =
+        damage(LF) - damage(HF) (> 0: LF damaged more), sign-flip permutation test.
+        The direct effect at equal baseline evidence (OLS intercept on the pair's
+        baseline gap, HC3) is reported with the same causal caveat as H2; it
+        extrapolates when the baseline gap is far from 0 (mean_base_gap).
         """
         covs = self.covariates
         ok = self.y & np.isin(self.fg, ["high", "low"])
@@ -2574,7 +2833,7 @@ class ModelAnalysis:
                         gap = eb[lf] - eb[hf]
                         if np.isfinite(d).all() and np.isfinite(gap).all() and len(d) > 3:
                             m = ols_hc3(d, pd.DataFrame({"base_gap": gap}))
-                            adj = {"selectivity_adjusted": m.params["const"], "p_adjusted": m.pvalues["const"],
+                            adj = {"selectivity_direct": m.params["const"], "p_direct": m.pvalues["const"],
                                    "mean_base_gap": float(gap.mean())}
                         else:
                             adj = {}
@@ -2611,6 +2870,9 @@ class ModelAnalysis:
                 dmg_rep[t] = -d[prim]
                 row = {"model": self.model, "family_model": self.family, "readout": name,
                        "readout_layer": r, "substituted_layer": t, "depth": t / max(self.L - 1, 1),
+                       "answer_mass_ratio": (float(np.nanmedian(z["behavior_mass"][t])
+                                                   / np.nanmedian(z["base_behavior_mass"]))
+                                             if name == "behavior" else np.nan),
                        "rope_mismatch": bool(z["rope_mismatch"][t]), "primary_metric": prim,
                        "after_readout": t > r,
                        "max_abs_logit_change": float(np.nanmax(np.abs(p_scores[t] - b_scores)))}
@@ -2714,7 +2976,7 @@ class ModelAnalysis:
                     rho, p = stats.spearmanr(-j["delta_primary"], j[col])
                     rows.append({"model": self.model, "family_model": self.family, "alignment": "H6",
                                  "outcome": col, "n_runs": len(j), "spearman_rho": rho, "p": p})
-        b = e_all[e_all.delta_behavior_auc.notna()]
+        b = e_all[e_all.delta_behavior_auc.notna() & (e_all.answer_mass_ratio >= self.cfg.BEHAVIOR_MASS_MIN_RATIO)]
         if len(b) >= 6 and b.delta_behavior_auc.nunique() > 1 and b.delta_primary.nunique() > 1:
             rho, p = stats.spearmanr(b.delta_primary, b.delta_behavior_auc)
             rows.append({"model": self.model, "family_model": self.family, "alignment": "H8c",
@@ -2724,29 +2986,35 @@ class ModelAnalysis:
     # ── 13. dose-response (H1d) ───────────────────────────────────────
     def dose_response(self, effects: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Points: no_reuse (0 layers), the uniform-random family mean at every k, and
-        `full` in every regime with the primary regime's exemption cutoff.
+        H1d test points share source distance 1 (CLA-2 heads): no_reuse (0 layers),
+        the uniform-random family mean at every k, and primary `full`.  `full` at
+        reuse factor 4 (sources 1-3 layers back) confounds dose with distance and is
+        reported as a point but excluded from the test.
         """
         P = self.cfg.primary_regime.name
-        ec0 = self.ec(P)
         e = effects[effects.band == "all"]
-        pts = [{"source": NO_REUSE, "n_substituted": 0, "kv_memory_fraction": 1.0,
-                "delta_primary": 0.0, "delta_auc_all": 0.0}]
+        pts = [{"source": NO_REUSE, "n_substituted": 0, "kv_memory_fraction": 1.0, "mean_source_distance": 0.0,
+                "delta_primary": 0.0, "delta_auc_all": 0.0, "in_test": True}]
         uni = e[(e.regime == P) & (e.family == UNIFORM)]
         for k, g in uni.groupby("k"):
             pts.append({"source": f"{UNIFORM}@k{k}", "n_substituted": int(k),
                         "kv_memory_fraction": float(g.kv_memory_fraction.mean()),
-                        "delta_primary": float(g.delta_primary.mean()), "delta_auc_all": float(g.delta_auc_all.mean())})
+                        "mean_source_distance": float(g.mean_source_distance.mean()),
+                        "delta_primary": float(g.delta_primary.mean()),
+                        "delta_auc_all": float(g.delta_auc_all.mean()), "in_test": True})
         for r in self.cfg.REGIMES:
             g = e[(e.regime == r.name) & (e.policy == FULL)]
-            if len(g) and self.ec(r.name) == ec0:
+            if len(g) and self.ec(r.name) == self.ec(P):
                 pts.append({"source": f"{FULL}[{r.name}]", "n_substituted": int(g.k.iloc[0]),
                             "kv_memory_fraction": float(g.kv_memory_fraction.iloc[0]),
+                            "mean_source_distance": float(g.mean_source_distance.iloc[0]),
                             "delta_primary": float(g.delta_primary.iloc[0]),
-                            "delta_auc_all": float(g.delta_auc_all.iloc[0])})
+                            "delta_auc_all": float(g.delta_auc_all.iloc[0]),
+                            "in_test": bool(g.mean_source_distance.iloc[0] == 1.0)})
         pts = pd.DataFrame(pts).assign(model=self.model, family_model=self.family)
-        rho, p = exact_spearman_upper(pts.n_substituted.to_numpy(float), -pts.delta_primary.to_numpy())
-        test = pd.DataFrame([{"model": self.model, "family_model": self.family, "n_points": len(pts),
+        t = pts[pts.in_test]
+        rho, p = exact_spearman_upper(t.n_substituted.to_numpy(float), -t.delta_primary.to_numpy())
+        test = pd.DataFrame([{"model": self.model, "family_model": self.family, "n_points": len(t),
                               "spearman_rho": rho, "p_exact_one_sided": p}])
         return pts, test
 
@@ -2872,7 +3140,7 @@ class CrossModelAnalysis:
         rhos = [stats.spearmanr(profiles[a], profiles[b])[0] for i, a in enumerate(names) for b in names[i + 1:]]
         return float(np.nanmean(rhos)) if rhos else np.nan
 
-    # ── pre-registered decision rules ─────────────────────────────────
+    # ── pre-specified decision rules ─────────────────────────────────
     def _subsets(self) -> Dict[str, List[str]]:
         subsets = {f"lofo_{f}": [m for m in self.models if self.family[m] != f] for f in sorted(self.family.unique())}
         subsets["excl_mixed_rope"] = [m for m in self.models if not self.mixed_rope[m]]
@@ -2953,7 +3221,7 @@ class CrossModelAnalysis:
                       "(exact one-sided Spearman p < alpha)", (d.spearman_rho > 0) & (d.p_exact_one_sided < a),
                       f"median rho = {d.spearman_rho.median():.3f}")
 
-        # H2 (ANCOVA primary), with floor exclusion
+        # H2 (change score, tokenisation-controlled, primary), with floor exclusion
         if len(reg):
             def h2(regime, family="full"):
                 r = reg[(reg.regime == regime) & (reg.family == family) & (reg.readout == "frozen")
@@ -2963,18 +3231,22 @@ class CrossModelAnalysis:
             if len(r_all):
                 lm = reg[(reg.regime == self.P) & (reg.family == FULL) & (reg.readout == "frozen")
                          & (reg.band == "all") & (reg.freq_measure == "lm_logprob") & ~reg.at_floor]
-                add_count("H2", "lower-frequency words lose more evidence given baseline evidence, n_tokens and "
-                          "covariates (ANCOVA, HC3, frozen, band 'all'; floor models not evaluable)",
-                          (r.beta_freq < 0) & (r.p_freq < a),
-                          f"at floor: {int(r_all.at_floor.sum())}; change score: "
-                          f"{int(((r.beta_freq_change_score < 0) & (r.p_freq_change_score < a)).sum())}/{len(r)}; "
+                def n_sig(beta, p):
+                    return f"{int(((r[beta] < 0) & (r[p] < a)).sum())}/{int(r[beta].notna().sum())}"
+                add_count("H2", "lower-frequency words lose more evidence (change score, n_tokens and orthographic "
+                          "covariates controlled, no baseline term; HC3, frozen, band 'all'; floor models not "
+                          "evaluable)", (r.beta_freq < 0) & (r.p_freq < a),
+                          f"at floor: {int(r_all.at_floor.sum())}; total effect (no n_tokens): "
+                          f"{n_sig('beta_freq_total', 'p_freq_total')}; relative damage: "
+                          f"{n_sig('beta_freq_relative', 'p_freq_relative')}; direct effect at equal baseline "
+                          f"(ANCOVA): {n_sig('beta_freq_direct', 'p_freq_direct')}; "
                           f"LM log-prob measure: {int(((lm.beta_freq < 0) & (lm.p_freq < a)).sum())}/{len(lm)}; "
                           f"median attenuation by n_tokens {np.nanmedian(r.attenuation_by_ntok):.2f}")
             for regime in [x.name for x in self.cfg.REGIMES if x.role == "sensitivity"]:
                 rs, rs_all = h2(regime)
                 if len(rs_all):
                     add_count(f"H5x[{regime}]", "exemption-free full: n_token slope of word damage > 0 "
-                              "(ANCOVA, HC3)", (rs.beta_ntok > 0) & (rs.p_ntok < a),
+                              "(change score, HC3)", (rs.beta_ntok > 0) & (rs.p_ntok < a),
                               f"frequency slope < 0 in {int(((rs.beta_freq < 0) & (rs.p_freq < a)).sum())}")
 
         # H3a, H3c, C1, C2: directional, item bootstrap
@@ -3006,8 +3278,11 @@ class CrossModelAnalysis:
                     excl = "supported (better than null)" if g.excl_mixed_rope_z > 0 else "supported (worse than null)"
                 else:
                     excl = "not supported"
+                note = (" SANITY CHECK, not a finding: the null replaces the adjacent head by any eligible "
+                        "head, so `full` is expected to win." if g.contrast.startswith("H4") else "")
                 rows.append({"hypothesis": g.contrast, "rule": "Stouffer-combined randomisation test vs "
-                             "null target sets (mid-p, Holm over contrasts; sensitivity columns unadjusted)",
+                             "null target sets (mid-p, exact randomisation null, Holm over contrasts; "
+                             "sensitivity columns unadjusted); conditional on the test items." + note,
                              "models_meeting_rule": int(g.n_models_upper_sig + g.n_models_lower_sig),
                              "models_evaluated": int(g.n_models), "models_required": np.nan,
                              "verdict": verdict, "robust_lofo": bool(robust), "verdict_excl_mixed_rope": excl,
@@ -3050,22 +3325,27 @@ class CrossModelAnalysis:
             floor = set(reg.loc[(reg.regime == self.P) & (reg.family == FULL) & reg.at_floor, "model"]) if len(reg) else set()
             full = full[~full.model.isin(floor)].set_index("model")
             if len(full):
-                add_count("H7b", "on matched pairs, full damages LF more than HF (selectivity > 0, sign-flip; "
-                          "floor models not evaluable)", (full["mean"] > 0) & (full.p_sign_flip < a),
-                          f"baseline-adjusted selectivity > 0 & p < alpha in "
-                          f"{int(((full.selectivity_adjusted > 0) & (full.p_adjusted < a)).sum())}/{len(full)}")
+                add_count("H7b", "on matched pairs, full damages LF more than HF (total-effect selectivity > 0, "
+                          "sign-flip; floor models not evaluable)", (full["mean"] > 0) & (full.p_sign_flip < a),
+                          f"direct effect at equal baseline > 0 & p < alpha in "
+                          f"{int(((full.selectivity_direct > 0) & (full.p_direct < a)).sum())}/{len(full)}; "
+                          f"median baseline gap = {full.mean_base_gap.median():.2f}")
 
         # H8a, H8b
         if len(beh):
             b0 = beh[beh.metric == "abs_auc_all"].set_index("model")
-            valid = b0.ci_low > 0.5
-            add_count("H8a", "few-shot behavioural lexical-decision AUC > 0.5 (bootstrap CI)", valid,
-                      f"median AUC = {b0.estimate.median():.3f}")
+            valid = (b0.ci_low > 0.5) & (b0.answer_mass_median >= self.cfg.BEHAVIOR_MIN_BASE_MASS)
+            add_count("H8a", f"few-shot behavioural lexical-decision AUC > 0.5 (bootstrap CI) and no_reuse puts "
+                      f">= {self.cfg.BEHAVIOR_MIN_BASE_MASS} probability on the answer tokens", valid,
+                      f"median AUC = {b0.estimate.median():.3f}, median answer mass = "
+                      f"{b0.answer_mass_median.median():.3f}")
             b1 = beh[(beh.regime == self.P) & (beh.family == FULL) & (beh.metric == "auc_all")].set_index("model")
-            b1 = b1[b1.index.isin(valid[valid].index)]
-            if len(b1):
-                add_count("H8b", "full lowers behavioural AUC (Holm, CI excludes 0; models passing H8a)",
-                          (b1.estimate < 0) & (b1.p_holm < a) & b1.ci_excludes_zero)
+            lost = b1[~b1.format_retained.astype(bool)].index
+            b1 = b1[b1.index.isin(valid[valid].index) & ~b1.index.isin(lost)]
+            add_count("H8b", f"full lowers behavioural AUC (Holm, CI excludes 0); evaluable only in models passing "
+                      f"H8a whose answer mass under full is >= {self.cfg.BEHAVIOR_MASS_MIN_RATIO} x no_reuse",
+                      (b1.estimate < 0) & (b1.p_holm < a) & b1.ci_excludes_zero,
+                      f"answer format lost under full in: {', '.join(lost) or 'none'}")
 
         # RQ8a, RQ8b
         if len(sg):
@@ -3227,11 +3507,22 @@ class CrossModelAnalysis:
         combined = self.combined_randomization()
         if len(combined):
             combined.to_csv(os.path.join(self.out, "randomization_combined.csv"), index=False)
+        r = self.cat("randomization")
+        if len(r):        # disclosure: per-model resolution of every randomisation test (min mid-p = 0.5 / N)
+            r = r[r.is_primary_k & (r.band == "all") & (r.statistic == "delta_primary")]
+            r.pivot_table(index="model", columns="contrast", values="null_space_size", aggfunc="first").to_csv(
+                os.path.join(self.out, "null_space_sizes.csv"))
+        e = self.cat("run_effects")
+        if len(e):        # pilot costing: wall-clock per model and tier
+            e = e[e.band == "all"]
+            e.groupby(["model", "tier"]).seconds.agg(["count", "sum", "mean"]).rename(
+                columns={"count": "n_runs", "sum": "total_seconds", "mean": "mean_seconds"}).to_csv(
+                os.path.join(self.out, "timing_summary.csv"))
         rules = self.decision_rules(combined, self.fragility_profiles())
         rules.to_csv(os.path.join(self.out, "decision_rules.csv"), index=False)
         if len(rules):
             self._latex(rules[["hypothesis", "models_meeting_rule", "models_evaluated", "verdict", "robust_lofo"]],
-                        "decision_rules", "Pre-registered decision rules evaluated on all models "
+                        "decision_rules", "Pre-specified decision rules evaluated on all models "
                         "(robust\\_lofo: verdict unchanged when any one model family is left out).")
         if len(mu):
             prim = mu[(mu.regime == self.P) & (mu.readout == "frozen") & mu.metric.isin(["auc_all", "d_all"])]
@@ -3276,7 +3567,8 @@ REFERENCES = [
     "Phipson & Smyth (2010) Permutation P-values Should Never Be Zero. Stat. Appl. Genet. Mol. Biol.",
     "Lancaster (1961) Significance Tests in Discrete Distributions. JASA.",
     "Stouffer et al. (1949) The American Soldier, Vol. 1. Princeton University Press.",
-    "Senn (2006) Change from Baseline and Analysis of Covariance Revisited. Statistics in Medicine.",
+    "Lord (1967) A Paradox in the Interpretation of Group Comparisons. Psychological Bulletin.",
+    "Pearl (2001) Direct and Indirect Effects. UAI.",
     "Holm (1979) A Simple Sequentially Rejective Multiple Test Procedure. Scand. J. Statistics.",
     "Benjamini & Hochberg (1995) Controlling the False Discovery Rate. JRSS-B.",
     "Wilcoxon (1945) Individual Comparisons by Ranking Methods. Biometrics Bulletin.",
@@ -3290,10 +3582,40 @@ class Experiment:
     def __init__(self, cfg: ExperimentConfig, analysis_only: bool = False):
         self.cfg, self.analysis_only = cfg, analysis_only
 
-    def _items(self) -> pd.DataFrame:
+    def _items_manifest(self) -> Dict:
+        def sha(path):
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        return {"filter_model_ids": sorted(self.cfg.ITEM_FILTER_MODEL_IDS),
+                "max_items_per_class": self.cfg.MAX_ITEMS_PER_CLASS,
+                "stimulus_template": self.cfg.STIMULUS_TEMPLATE, "task_template": self.cfg.task_template(),
+                "words_sha256": sha(self.cfg.WORDS_PATH), "nonwords_sha256": sha(self.cfg.NONWORDS_PATH)}
+
+    def _items(self, build: bool = False) -> pd.DataFrame:
+        """
+        The item table is a design constant shared by every model: it is built once,
+        filtered by the tokenizers of ALL models in ITEM_FILTER_MODEL_IDS, and stored
+        with a manifest.  A cached table whose manifest differs (other models, an item
+        cap from a pilot, other templates or inputs) is refused, never reused.  A job
+        that runs a subset of the models never builds the table itself, so parallel
+        per-model jobs cannot race or diverge: build it first (KV_BUILD_ITEMS_ONLY=1).
+        """
         path = os.path.join(self.cfg.OUTPUT_DIR, "items.csv")
-        if self.cfg.RESUME and os.path.exists(path):
+        meta_path = os.path.join(self.cfg.OUTPUT_DIR, "items_manifest.json")
+        expected = self._items_manifest()
+        if os.path.exists(path) and not build:
+            if not os.path.exists(meta_path):
+                raise RuntimeError(f"{path} has no items_manifest.json; rebuild it with KV_BUILD_ITEMS_ONLY=1")
+            with open(meta_path) as f:
+                built = json.load(f)
+            if built != expected:
+                raise RuntimeError(f"{path} was built for {built}, not {expected}; use a separate KV_OUTPUT_DIR")
             return pd.read_csv(path)
+        if os.path.exists(path):
+            raise RuntimeError(f"{path} already exists; delete it deliberately before rebuilding")
+        if sorted(m.model_id for m in self.cfg.MODELS) != expected["filter_model_ids"] and not build:
+            raise RuntimeError("this job runs a subset of the models and no item table exists: build it first "
+                               "with KV_BUILD_ITEMS_ONLY=1 and the full model list")
         words, nonwords = read_pools(self.cfg)
         pool = pd.concat([words, nonwords], ignore_index=True)
         valid, report = tokenizer_validity(self.cfg, pool["stimulus"].tolist())
@@ -3302,11 +3624,42 @@ class Experiment:
                     + report.to_string(index=False))
         keep = set(pool.loc[valid, "stimulus"])
         items = build_items(self.cfg, words[words.stimulus.isin(keep)], nonwords[nonwords.stimulus.isin(keep)])
-        items.to_csv(path, index=False)
+        items.to_csv(path + ".tmp", index=False)
+        with open(meta_path + ".tmp", "w") as f:
+            json.dump(expected, f, indent=2)
+        os.replace(meta_path + ".tmp", meta_path)
+        os.replace(path + ".tmp", path)
         return items
+
+    def _prespecification(self) -> Dict:
+        """
+        SHA-256 of this script and of the analysis-relevant configuration, written
+        once (first run) with a timestamp and checked on every later run.  Register
+        these hashes (with the decision rules) on OSF before the full run: code-defined
+        rules alone are not a pre-registration.
+        """
+        with open(os.path.abspath(__file__), "rb") as f:
+            script_sha = hashlib.sha256(f.read()).hexdigest()
+        run_scoped = {"OUTPUT_DIR", "RESULTS_DIR", "PAPER_DIR", "MODELS", "RESUME", "STATE_STORE", "STATE_DIR",
+                      "WORDS_PATH", "NONWORDS_PATH", "DOWNSTREAM_MODELS"}
+        config = json.dumps({k: str(v) for k, v in sorted(vars(self.cfg).items()) if k not in run_scoped})
+        current = {"script_sha256": script_sha, "config_sha256": hashlib.sha256(config.encode()).hexdigest()}
+        path = os.path.join(self.cfg.OUTPUT_DIR, "prespecification_manifest.json")
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                json.dump(current | {"frozen_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}"}, f, indent=2)
+            return current | {"matches_frozen": True}
+        with open(path) as f:
+            frozen = json.load(f)
+        ok = all(frozen[k] == v for k, v in current.items())
+        if not ok:
+            logger.warning(f"script or configuration differs from the manifest frozen at {frozen['frozen_at']}: "
+                           f"results are NOT from the pre-specified analysis")
+        return current | {"matches_frozen": ok, "frozen_at": frozen["frozen_at"]}
 
     def run(self):
         t0 = datetime.now()
+        prespec = self._prespecification()
         items = self._items()
         splits = make_splits(items, self.cfg)
         per_model, failed = {}, {}
@@ -3335,7 +3688,10 @@ class Experiment:
                        "torch": torch.__version__, "transformers": transformers.__version__,
                        "compute_dtype": str(COMPUTE_DTYPE), "models_analysed": list(per_model),
                        "failures": failed,
-                       "inference_note": "all CIs and p-values are conditional on the fitted, seed-averaged probes",
+                       "prespecification": prespec,
+                       "inference_note": "all CIs and p-values are conditional on the fitted, seed-averaged probes; "
+                                         "randomisation tests are conditional on the test items (item-level "
+                                         "generalisation rests on the item-bootstrap contrasts)",
                        "config": {k: (v if isinstance(v, (int, float, str, bool, list, dict, type(None)))
                                       else str(v)) for k, v in vars(self.cfg).items() if k != "MODELS"},
                        "models": [vars(m) for m in self.cfg.MODELS],
@@ -3353,6 +3709,11 @@ def main():
             raise SystemExit(f"No model matched KV_MODELS={os.environ['KV_MODELS']!r}")
     if os.environ.get("KV_MAX_ITEMS_PER_CLASS"):
         cfg.MAX_ITEMS_PER_CLASS = int(os.environ["KV_MAX_ITEMS_PER_CLASS"])
+    if os.environ.get("KV_BUILD_ITEMS_ONLY", "").lower() in ("1", "true", "yes"):
+        if os.environ.get("KV_MODELS"):
+            raise SystemExit("build the item table with the full model list (unset KV_MODELS)")
+        Experiment(cfg)._items(build=True)
+        return None
     analysis_only = os.environ.get("KV_ANALYSIS_ONLY", "").lower() in ("1", "true", "yes")
     for path in (cfg.WORDS_PATH, cfg.NONWORDS_PATH):
         if not os.path.exists(path):
