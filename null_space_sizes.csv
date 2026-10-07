@@ -1,0 +1,8 @@
+model,H3b_cka_high_vs_depth_matched,H3b_cka_low_vs_depth_matched,H3b_fidelity_high_vs_depth_matched,H3b_kvdist_high_vs_depth_matched,H3b_kvdist_low_vs_depth_matched,H3d_cka_high_vs_uniform,H3d_cka_low_vs_uniform,H3d_fidelity_high_vs_uniform,H3d_kvdist_high_vs_uniform,H3d_kvdist_low_vs_uniform,H3e_kvsharer_dissimilar_vs_random_pairs,H3e_kvsharer_similar_vs_random_pairs,H4_own_head_vs_random_source
+Llama-3.2-1B,4,4,4,4,1,15,15,15,15,15,5401,5401,720
+Llama-3.2-3B,12,12,16,72,18,330,330,330,330,330,385183029,385183029,39916800
+Qwen2.5-1.5B,12,12,72,48,72,330,330,330,330,330,385183029,385183029,39916800
+Qwen2.5-3B,60,200,300,60,20,2002,2002,2002,2002,2002,291172239540,291172239540,87178291200
+Qwen3-4B-Base,400,400,300,100,400,2002,2002,2002,2002,2002,291172239540,291172239540,87178291200
+SmolLM2-360M,1,36,96,96,16,495,495,495,495,495,1227223305,1227223305,479001600
+SmolLM3-3B-Base,60,200,20,60,200,2002,2002,2002,2002,2002,291172239540,291172239540,87178291200
