@@ -154,13 +154,59 @@ key, a value and a query-INDEPENDENT log-mass:
               against a single pass and, for the full cache, against HF generate().
   Memory      matched PER SAMPLE: every compressed method stores <= KEEP x the fp16 context
               cache (KEEP_FRACTIONS = 1/4, 1/8, 1/16); the stored fraction is measured from
-              the captured state and reported per sample.  Baselines: full cache, KIVI-2/4,
-              SnapKV (Li et al., 2024; pooling kernel 7, window 32), StreamingLLM (Xiao et al.,
-              2024), chunk-local eviction / mean merge / Attention-Matching-lite, ablations.
-  Outputs     results/<model>/bench/: bench_samples.csv (per sample x method), task scores,
-              paired contrasts (sign-flip test on per-sample scores, Holm per benchmark),
+              the captured state and reported per sample; contrasts use only units where
+              both methods are within KEEP (1 + BUDGET_TOL) (vs KIVI: memory_A <= memory_B
+              (1 + BUDGET_TOL)); exclusions are counted.
+  Baselines   (a) OFFICIAL NVIDIA kvpress presses (v0.5.5, constructed as its
+              evaluate_registry): SnapKV, PyramidKV, AdaKV-SnapKV, Expected Attention
+              (AdaKV, eps 1e-2), TOVA, Knorm, StreamingLLM; compression_ratio = 1 - KEEP; run on
+              the native path (below).  AdaKV-based presses MASK keys rather than removing
+              them, so their memory is the nominal budget (flagged per row).
+              (b) harness: full cache, KIVI-2/4 (Liu et al., 2024; residual 32, not 128),
+              SnapKV replica of kvpress' SnapKVPress (window 64, kernel 5, n_kept =
+              int(n (1 - ratio))), StreamingLLM, chunk-local eviction / mean merge /
+              Attention-Matching-lite, ablations.  harness_check: contrasts (full vs native_full,
+              SnapKV replica vs official) are two-sided implementation checks, never decisions.
+  Paths       harness   fp32 reference simulation (TiltKV and everything compared at the
+                        attention-statistics level); decoding from LayerState.
+              native    Hugging Face SDPA + DynamicCache in the model dtype; kvpress'
+                        KVPressTextGenerationPipeline._forward / generate_answer replicated
+                        (checked against the official pipeline: official_pipeline_agreement).
+  Statistics  per-sample paired differences; estimand = macro mean over tasks (official
+              aggregation); task-stratified bootstrap CI and sign-flip p; Holm per
+              benchmark; cross-model rule (>= 7/9 models significant and Wilcoxon over models).
+  Outputs     results/<model>/bench/: bench_samples.csv (per sample x method, with all
+              systems fields), bench_task_scores.csv (per task, macro_avg, LongBench-E length
+              buckets 0-4k / 4-8k / 8k+), bench_systems.csv, bench_contrasts.csv,
               pred/<benchmark>/<method>/<task>.jsonl in the official LongBench eval.py format;
-              top level: bench_decision_rules.csv (cross-model rule).
+              top level: bench_decision_rules.csv, bench_all_systems.csv.
+
+════════════════════════════════════════════════════════════════════════════════════════
+6. SYSTEMS MEASUREMENTS (per sample; what each number is, and how faithful it is)
+════════════════════════════════════════════════════════════════════════════════════════
+  payload_bytes       MEASURED nbytes of the compressed context cache materialised in its
+                      storage format: fp16 exact rows; bit-packed int codes + fp16 scales
+                      (8-bit tails; KIVI codes + per-group fp16 scale / zero); fp16 TiltKV
+                      atoms (Prop. 5 fields).  analytic_bytes = state_bits / 8 must agree.
+                      native rows: nbytes of the DynamicCache tensors after the press.
+  memory_fraction     analytic stored bits / fp16 context cache (harness), measured cached
+                      tokens / context tokens (native), nominal budget (AdaKV masking).
+  sim_state_bytes     MEASURED allocator size of the harness decode state (dense, dequantised,
+                      compute dtype) -- what this reference implementation holds, not a kernel.
+  peak_*_bytes        torch.cuda.max_memory_allocated, reset before prefill and before decode
+                      (weights + activations + cache; NaN on CPU).
+  tokenize_s          tokenisation + chat template of the sample (data loading excluded).
+  prefill_s, ttft_s   synchronised wall clock; TTFT = prefill (+ question pass on native).
+  decode_s, tokens/s  synchronised wall clock of the greedy loop; tokens/s = (n_gen - 1) / decode_s.
+  attn_flops_*        ANALYTIC attention FLOPs per decoded token over the actual cache state
+                      (2 per multiply-add; Prop. 5 atom cost), *_full for the uncompressed cache.
+  flops_decode_step_measured   torch.utils.flop_counter.FlopCounterMode over one complete
+                      decode step (matmul / SDPA class ops counted by torch; elementwise ops not).
+  model_dtype, attention_dtype recorded per row.
+  FIDELITY: harness timings and peaks measure an fp32 reference implementation without
+  fused kernels; they are NOT deployment speed for TiltKV.  Only native / kvpress rows
+  measure an optimised path.  A fused TiltKV kernel does not exist yet; its speed is not
+  claimed.  Bytes and FLOPs are implementation-independent and comparable across paths.
 
 Usage
     python TILT_KV.py --smoke                                     # core suite, offline CPU
@@ -170,9 +216,12 @@ Usage
            --tasks qasper hotpotqa trec repobench-p --ruler-lengths 4096 8192 16384
     python TILT_KV.py --suite longppl --models Llama-3.1-8B-Instruct --long-ppl-len 16384
     Useful: --keep 0.25 0.125 --max-samples 50 --methods tilt@ snapkv@ streamingllm@ --query-aware
-Requires torch >= 2.4, transformers >= 4.56 (tested on 5.19), scipy, pandas, datasets and
+Requires torch >= 2.4, transformers >= 4.56 (tested on 5.2.0), scipy, pandas, datasets and
 huggingface_hub (benchmarks), fuzzywuzzy or rapidfuzz (code tasks), rouge (summarisation
-tasks), matplotlib (optional).  Gated models (Llama) need `huggingface-cli login`.
+tasks), matplotlib (optional), kvpress >= 0.5.5 (official SOTA baselines; optional, skipped
+with a warning if absent -- on Python 3.13 its dependency `fire` imports the removed module
+`pipes`; use Python <= 3.12 or provide a one-line pipes.py: `from shlex import quote`).
+Gated models (Llama) need `huggingface-cli login`.
 
 Validation status (be explicit in any write-up)
   Verified with --smoke only: CPU, two tiny models (Llama; SmolLM3 with NoPE layers)
@@ -197,6 +246,21 @@ Validation status (be explicit in any write-up)
     token for token for full, KIVI, SnapKV, StreamingLLM, TiltKV, mean, AM (agreement 1.000)
     and matched HF generate() for the full cache; measured memory 0.24-0.25 at a 0.25
     budget; gold answers score 100 through the whole pipeline; metric unit tests pass.
+  * Official kvpress 0.5.5 (tiny model, same smoke): native path == kvpress'
+    KVPressTextGenerationPipeline._forward (identical answers) for no press, SnapKV and
+    StreamingLLM; the harness SnapKV / StreamingLLM replicas generate the same tokens as the
+    official presses (agreement 1.000) at the same kept fraction (0.2476 at keep 0.25).
+    PyramidKV raised inside kvpress at keep 0.5 on the 329-token toy prompt (recorded as a
+    press error, score NaN, excluded); it ran at keep 0.25.
+  * Systems: payload_bytes == analytic_bytes exactly for full, SnapKV, StreamingLLM,
+    TiltKV, eviction, mean merge and AM; KIVI payload is 0.4-0.5% above analytic (fp16 scale /
+    zero of the last partial group).  Measured FLOPs of one decode step agree between the
+    native and harness full cache (639k on the toy model).  Harness SnapKV has more measured
+    FLOPs than official SnapKV at the same memory (head-wise evicted rows remain masked
+    within the union of kept columns); analytic FLOPs are equal.  Peak memory is NaN on CPU.
+  * Metric code differential-tested against the official LongBench metrics.py / eval.py and
+    kvpress' RULER scorer: 0 mismatches (4000 random cases per metric; 10 task scorers).
+  * The toy model scores 0 on most synthetic tasks: the smoke tests the engine, not quality.
   * NOT run: real Hugging Face datasets and real LLMs (this environment cannot reach the
     Hub).  Dataset ids and columns follow kvpress' evaluation code; check the first run.
   No real-LLM result exists yet; every claim is a hypothesis for the decision rules.
@@ -217,7 +281,8 @@ import sys
 import time
 import zlib
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -398,7 +463,12 @@ class Config:
     PG19_HF: str = "emozilla/pg19-test"
     KEEP_FRACTIONS: Tuple[float, ...] = (0.25, 0.125, 0.0625)   # 4x, 8x, 16x smaller context cache
     PRIMARY_KEEP: float = 0.125
-    SNAPKV_KERNEL: int = 7
+    SNAPKV_WINDOW: int = 64                              # kvpress SnapKVPress defaults (v0.5.5)
+    SNAPKV_KERNEL: int = 5
+    # official NVIDIA kvpress presses run as SOTA baselines on the native HF path (if installed)
+    KVPRESS_PRESSES: Tuple[str, ...] = ("snapkv", "pyramidkv", "adakv_snapkv", "expected_attention",
+                                        "tova", "knorm", "streaming_llm")
+    MEASURE_FLOPS: bool = True                           # FlopCounterMode over the first decode step
     MAX_CONTEXT_TOKENS: int = 32000
     QUERY_AWARE: bool = False                            # True: question is compressed with the context
     USE_CHAT_TEMPLATE: bool = True
@@ -503,10 +573,10 @@ class Router:
     active = None
 
 
-def tilt_attention(module, query, key, value, attention_mask, **kwargs):
+def tilt_attention(module, query, key, value, attention_mask, *args, **kwargs):
     ctl = Router.active
     if ctl is None:
-        return _SDPA(module, query, key, value, attention_mask, **kwargs)
+        return _SDPA(module, query, key, value, attention_mask, *args, **kwargs)
     return ctl.attend(module, query, key, value, attention_mask, kwargs)
 
 
@@ -898,6 +968,10 @@ class LayerState:
     """
 
     def __init__(self, K, V, pos, hide, tok, mom, extra: int, shared: Optional[int] = None):
+        # keep only rows readable by at least one KV head: decode memory and FLOPs then scale
+        # with the compressed cache (head-wise evicted rows remain masked within kept columns)
+        cols = (hide.to(K.device) >= BIG).any(0).any(0)
+        K, V, pos, hide = K[:, :, cols], V[:, :, cols], pos.to(K.device)[cols], hide.to(K.device)[:, :, cols]
         B, H, n, d = K.shape
         cap = n + extra
         self.K = K.new_zeros((B, H, cap, d))
@@ -1114,7 +1188,8 @@ class ChunkedMethod(LayerMethod):
     def state_bits(self, d, context_len):
         out = super().state_bits(d, context_len)
         if self.m.family == "mean":       # correct the one mean atom per (chunk, head)
-            n_atoms = sum(len(chunk_plan(st.n, self.cfg, context_len)) for st in self.states.values()) \
+            # chunks compacted before the horizon (st.n counts stored rows, not positions)
+            n_atoms = sum(len(chunk_plan(context_len, self.cfg, context_len)) for st in self.states.values()) \
                 * next(iter(self.states.values())).K.shape[0] * next(iter(self.states.values())).K.shape[1]
             out["tok"] += n_atoms * (16.0 * atom_floats(self.m, d) - token_bits(d, self.cfg.KEEP_BITS))
             out["total"] = out["exact"] + out["tok"] + out["mom"]
@@ -1171,11 +1246,13 @@ class ChunkedMethod(LayerMethod):
 
 class SnapKVMethod(LayerMethod):
     """
-    SnapKV (Li et al., NeurIPS 2024): after prefilling the context, each KV head keeps the
-    tokens most attended by the last W_OBS context queries (scores summed over the window,
-    averaged over the query heads of the KV group, average-pooled with kernel SNAPKV_KERNEL)
-    plus the observation window itself.  One-shot at the horizon; queries before the horizon
-    use full attention (as in the original method), later tokens are kept exact.
+    SnapKV (Li et al., NeurIPS 2024), replicated from NVIDIA kvpress' SnapKVPress (v0.5.5):
+    the last SNAPKV_WINDOW context queries attend to the context (causal, fp32 softmax); the
+    window columns are dropped; scores = mean over the window queries, avg_pool1d (kernel
+    SNAPKV_KERNEL, padding k//2, count_include_pad as torch's default), averaged over the
+    query heads of each KV group; the window gets max + 1 so it is kept; the top n_kept =
+    max(1, int(P * keep)) positions per KV head survive (kvpress' compute_n_kept).  Queries
+    before the horizon use full attention (compression happens after prefill).
     """
     family = "snapkv"
     one_shot = True
@@ -1189,22 +1266,23 @@ class SnapKVMethod(LayerMethod):
         T = k.shape[2]
         H = self.horizon(T)
         B, Hkv = k.shape[0], k.shape[1]
-        w = min(c.W_OBS, H)
-        if self.freeze_at is None or self.keep >= H:
+        w = c.SNAPKV_WINDOW
+        if self.freeze_at is None or self.keep >= H or H <= w:
             return LayerMethod.entries(self, li, q, k, v, scaling, pos)
-        qo = q[:, :, H - w:H].float() * scaling                             # (B,Hq,w,d)
-        kk = rep_heads(k[:, :, :H].float(), q.shape[1] // Hkv)
-        sc = qo @ kk.transpose(-1, -2)                                     # (B,Hq,w,H)
-        causal = torch.arange(H, device=k.device)[None, :] <= torch.arange(H - w, H, device=k.device)[:, None]
-        att = sc.masked_fill(~causal, float("-inf")).softmax(-1).sum(2)    # (B,Hq,H)
-        att = att.view(B, Hkv, -1, H).mean(2)[..., :H - w]                  # prefix only
-        ks = c.SNAPKV_KERNEL
-        att = F.avg_pool1d(att.reshape(B * Hkv, 1, -1), ks, stride=1, padding=ks // 2,
-                           count_include_pad=False).view(B, Hkv, -1)[..., :H - w]
-        top = torch.topk(att, max(0, self.keep - w), dim=-1).indices
+        rep = q.shape[1] // Hkv
+        qo = q[:, :, H - w:H].float()
+        kk = rep_heads(k[:, :, :H].float(), rep)
+        att = (qo @ kk.transpose(-1, -2)) * scaling                         # (B,Hq,w,H)
+        att = att + torch.triu(torch.full_like(att, float("-inf")), diagonal=H - w + 1)
+        att = att.softmax(-1)[..., :-w]                                    # (B,Hq,w,H-w)
+        sc = att.mean(-2)
+        sc = F.avg_pool1d(sc, kernel_size=c.SNAPKV_KERNEL, padding=c.SNAPKV_KERNEL // 2, stride=1)
+        sc = sc.view(B, Hkv, rep, H - w).mean(2)
+        sc = F.pad(sc, (0, w), value=float(sc.max()) + 1)
+        top = sc.topk(self.keep, dim=-1).indices
         kept = torch.zeros((B, Hkv, T), dtype=torch.bool, device=k.device)
         kept.scatter_(-1, top, True)
-        kept[..., H - w:] = True                                           # window + post-horizon
+        kept[..., H:] = True                                               # post-horizon tokens
         hide = torch.where(kept, torch.full((B, Hkv, T), BIG, dtype=torch.long, device=k.device),
                            torch.full((B, Hkv, T), H, dtype=torch.long, device=k.device))
         return k, v, hide, None, None
@@ -1213,8 +1291,9 @@ class SnapKVMethod(LayerMethod):
 class StreamingLLMMethod(LayerMethod):
     """
     StreamingLLM (Xiao et al., ICLR 2024): sinks + the most recent tokens.  With a horizon it
-    is one-shot (keep sinks + the last keep - N_SINK context tokens); without one it is the
-    streaming policy (every query reads sinks + its last keep - N_SINK tokens).
+    is one-shot as kvpress' StreamingLLMPress (n_sink = N_SINK = 4, n_kept = int(P * keep),
+    no key re-rotation); without one it is the streaming policy (every query reads the sinks
+    + its last keep - N_SINK tokens), used for long-document perplexity.
     """
     family = "streamingllm"
 
@@ -2386,16 +2465,48 @@ def encode_item(runner: "Runner", item: Dict, max_new: int, cfg: "Config", chat_
 @dataclass(frozen=True)
 class BenchSpec:
     name: str
-    family: str                        # full | kivi | cla | snapkv | streamingllm | chunk
+    family: str                        # full | kivi | cla | snapkv | streamingllm | chunk | native | kvpress
     keep: Optional[float] = None       # memory budget: fraction of the fp16 context cache
     kivi_bits: Optional[int] = None
     chunk: Optional[ChunkMethod] = None
+    press: Optional[str] = None        # kvpress press name (official implementation)
+
+
+@lru_cache(maxsize=1)
+def kvpress_available() -> bool:
+    try:
+        import kvpress  # noqa: F401
+        return True
+    except Exception as e:                  # ImportError, or Python 3.13 + fire 0.6 ('pipes')
+        logger.warning(f"kvpress unavailable ({e!r}); official SOTA presses are skipped")
+        return False
+
+
+def build_press(name: str, keep: float):
+    """Official kvpress presses, constructed as in kvpress' evaluate_registry.py (v0.5.5)."""
+    import kvpress as K
+    ratio = 1.0 - keep
+    presses = {"snapkv": lambda: K.SnapKVPress(), "pyramidkv": lambda: K.PyramidKVPress(),
+               "adakv_snapkv": lambda: K.AdaKVPress(K.SnapKVPress()),
+               "expected_attention": lambda: K.AdaKVPress(K.ExpectedAttentionPress(epsilon=1e-2)),
+               "tova": lambda: K.TOVAPress(), "knorm": lambda: K.KnormPress(),
+               "streaming_llm": lambda: K.StreamingLLMPress()}
+    press = presses[name]()
+    press.compression_ratio = ratio            # as evaluate.py: set after construction (AdaKV delegates)
+    return press
+
+
+MASKING_PRESSES = ("adakv_snapkv", "expected_attention")   # AdaKV masks keys: memory is nominal
 
 
 def bench_specs(cfg: "Config", for_ppl: bool = False) -> List[BenchSpec]:
     out = [BenchSpec("full", "full")] + [BenchSpec(f"kivi{b}", "kivi", kivi_bits=b) for b in cfg.KIVI_BITS]
+    if not for_ppl:
+        out.append(BenchSpec("native_full", "native"))       # HF SDPA + DynamicCache reference
+    presses = list(cfg.KVPRESS_PRESSES) if (not for_ppl and cfg.KVPRESS_PRESSES and kvpress_available()) else []
     for r in cfg.KEEP_FRACTIONS:
         t = f"{r:g}"
+        out += [BenchSpec(f"kvpress:{pn}@{t}", "kvpress", r, press=pn) for pn in presses]
         if not for_ppl:
             out.append(BenchSpec(f"snapkv@{t}", "snapkv", r))
         out.append(BenchSpec(f"streamingllm@{t}", "streamingllm", r))
@@ -2440,11 +2551,13 @@ def make_method(spec: BenchSpec, P: int, runner: "Runner", cfg: "Config"):
         return KIVIMethod(cfg, spec.kivi_bits), ""
     if spec.family == "cla":
         return CLAMethod(cfg, runner.L), ""
-    if spec.family == "snapkv":
-        keep = max(cfg.W_OBS + 1, int(round(spec.keep * P)))
-        return SnapKVMethod(cfg, keep, spec.name), ("" if keep < P else "budget >= context")
+    if spec.family in ("native", "kvpress"):
+        return None, ""                                     # handled by native_generate
+    if spec.family == "snapkv":                             # kvpress' compute_n_kept
+        keep = max(1, int(P * spec.keep))
+        return SnapKVMethod(cfg, keep, spec.name), ("" if P > cfg.SNAPKV_WINDOW else "context <= window")
     if spec.family == "streamingllm":
-        keep = max(cfg.N_SINK + 1, int(round(spec.keep * P)))
+        keep = max(cfg.N_SINK + 1, int(P * spec.keep))
         return StreamingLLMMethod(cfg, keep, spec.name), ("" if keep < P else "budget >= context")
     r, note = chunk_rate_for_budget(P, spec.keep, spec.chunk, runner.d, cfg)
     if r is None:
@@ -2454,6 +2567,179 @@ def make_method(spec: BenchSpec, P: int, runner: "Runner", cfg: "Config"):
     if not m.plan["feasible"]:
         return LayerMethod(cfg), "infeasible chunk code"
     return m, note
+
+
+# ── Systems measurements ────────────────────────────────────────────────────────────
+#
+# Fidelity (stated in every output row):
+#   payload_bytes      MEASURED: the compressed context cache is materialised in its storage
+#                      format (fp16 exact rows; bit-packed integer codes + fp16 scales/zeros;
+#                      fp16 atoms) and the tensors' nbytes are summed.  analytic_bytes is the
+#                      same quantity from the bit formulas (a consistency check).
+#   sim_state_bytes    MEASURED allocator size of the reference harness' decode state (dense,
+#                      dequantised, compute dtype): what THIS implementation holds, not a kernel.
+#   peak_*_bytes       MEASURED torch.cuda.max_memory_allocated per phase (NaN on CPU).
+#   *_s, tokens_per_s  MEASURED wall clock with device synchronisation; tokenisation timed
+#                      separately; data loading excluded.  Harness timings measure the fp32
+#                      reference implementation (no fused kernels); native_* / kvpress:* rows
+#                      measure Hugging Face SDPA + DynamicCache (+ official press hooks).
+#   attn_flops_*       ANALYTIC attention FLOPs per decoded token from the actual cache state
+#                      (multiply-add = 2 FLOPs); flops_decode_step_measured is torch's
+#                      FlopCounterMode over one full decode step (matmul-class ops only).
+
+def _sync():
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _reset_peak():
+    if DEVICE.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _peak() -> float:
+    return float(torch.cuda.max_memory_allocated()) if DEVICE.type == "cuda" else float("nan")
+
+
+def tensor_bytes(obj) -> int:
+    if isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(tensor_bytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(tensor_bytes(v) for v in obj)
+    return 0
+
+
+def pack_codes(codes: torch.Tensor, bits: int) -> torch.Tensor:
+    """Bit-pack non-negative integer codes (< 2^bits) into a uint8 tensor (MSB first)."""
+    c = codes.reshape(-1).to(torch.int64).cpu().numpy()
+    bitplanes = ((c[:, None] >> np.arange(bits - 1, -1, -1)) & 1).astype(np.uint8)
+    return torch.from_numpy(np.packbits(bitplanes.reshape(-1)))
+
+
+def _absmax_codes(xhat: torch.Tensor, bits: int):
+    """Integer codes + fp16 scales of per-vector absmax quantisation (exact for fake_quant_tokens)."""
+    qmax = 2 ** (bits - 1) - 1
+    sc = xhat.abs().amax(-1, keepdim=True).clamp_min(1e-8) / qmax
+    return (xhat / sc).round().clamp(-qmax, qmax).to(torch.int64) + qmax, sc.half()
+
+
+@torch.no_grad()
+def payload_bytes(method: LayerMethod, k_all: Dict[int, Tuple[torch.Tensor, torch.Tensor]], context_len: int) -> int:
+    """MEASURED bytes of the compressed context cache in its storage format (see header)."""
+    total = 0
+    c = method.cfg
+    for li, st in method.states.items():
+        if st.shared is not None:
+            continue
+        n = st.n
+        live = (st.hide[:, :, :n] >= BIG) & (st.pos[:n] < context_len)[None, None]
+        total += tensor_bytes(st.K[:, :, :n][live].half()) + tensor_bytes(st.V[:, :, :n][live].half())
+        if isinstance(method, KIVIMethod) and li in k_all:
+            k, v = k_all[li]
+            total += kivi_payload_bytes(k, v, method.bits, c, context_len)
+            continue
+        if st.tok is not None:
+            fin = torch.isfinite(st.tok["b"])
+            tk, tv, tb = st.tok["k"][fin], st.tok["v"][fin], st.tok["b"][fin]
+            if isinstance(method, ChunkedMethod) and method.m.family == "mean":
+                atom = tb != 0                                     # mean atoms carry log n > 0
+                total += tensor_bytes(tk[atom].half()) + tensor_bytes(tv[atom].half()) + tensor_bytes(tb[atom].half())
+                tk, tv, tb = tk[~atom], tv[~atom], tb[~atom]
+            if tk.numel():
+                for x in (tk, tv):
+                    if c.KEEP_BITS >= 16:
+                        total += tensor_bytes(x.half())
+                    else:
+                        codes, sc = _absmax_codes(x, c.KEEP_BITS)
+                        total += tensor_bytes(pack_codes(codes, c.KEEP_BITS)) + tensor_bytes(sc)
+                if isinstance(method, ChunkedMethod) and method.m.family == "am":
+                    total += tensor_bytes(tb.half())
+        if st.mom is not None:
+            fin = torch.isfinite(st.mom["logn"])
+            for key_, x in st.mom.items():
+                if isinstance(x, torch.Tensor) and key_ != "tau":
+                    total += tensor_bytes(x[fin].half())
+    return int(total)
+
+
+def kivi_payload_bytes(k, v, bits, cfg, context_len) -> int:
+    """Packed KIVI codes + fp16 scale/zero for the context rows read quantised at the horizon."""
+    T = k.shape[2]
+    n_q = max(0, min(T, context_len) - cfg.WINDOW - cfg.N_SINK)         # rows with n + W <= H - 1
+    if n_q <= 0:
+        return 0
+    G = cfg.KIVI_GROUP
+    B, H, _, d = k.shape
+    rows = slice(cfg.N_SINK, cfg.N_SINK + n_q)
+    kq, vq = k[:, :, rows].float(), v[:, :, rows].float()
+    qmax = 2 ** bits - 1
+    n_groups = int(math.ceil(n_q / G))
+    pad = n_groups * G - n_q
+    kg = F.pad(kq, (0, 0, 0, pad)).view(B, H, n_groups, G, d)
+    lo, hi = kg.amin(3), kg.amax(3)                                     # per (group, channel)
+    kcodes = ((kg - lo[:, :, :, None]) / ((hi - lo).clamp_min(1e-8)[:, :, :, None] / qmax)).round().clamp(0, qmax)
+    gv = G if d % G == 0 else d
+    vg = vq.reshape(B, H, n_q, d // gv, gv)
+    vlo, vhi = vg.amin(-1), vg.amax(-1)                                 # per (token, channel group)
+    vcodes = ((vg - vlo[..., None]) / ((vhi - vlo).clamp_min(1e-8)[..., None] / qmax)).round().clamp(0, qmax)
+    kcodes = kcodes.reshape(B, H, n_groups * G, d)[:, :, :n_q]          # drop the padding rows
+    return (tensor_bytes(pack_codes(kcodes, bits))
+            + tensor_bytes(pack_codes(vcodes, bits))
+            + tensor_bytes(lo.half()) + tensor_bytes(hi.half()) + tensor_bytes(vlo.half()) + tensor_bytes(vhi.half()))
+
+
+def attn_flops_per_token(method: LayerMethod, Hq: int, d: int) -> float:
+    """ANALYTIC attention FLOPs of one decoded token over the captured state (all layers)."""
+    total = 0.0
+    for li, st in method.states.items():
+        src = method.states[st.shared] if st.shared is not None else st
+        Hkv = src.K.shape[1]
+        rep = Hq // Hkv
+        n_exact = float((src.hide[:, :, :src.n] >= BIG).sum()) / src.K.shape[0]   # summed over KV heads
+        n_tok = float(torch.isfinite(src.tok["b"]).sum()) / src.K.shape[0] if src.tok is not None else 0.0
+        f = (4 * d + 5) * (n_exact + n_tok)                                # QK, PV, softmax
+        if src.mom is not None:
+            m = src.mom
+            na = float(torch.isfinite(m["logn"]).sum()) / src.K.shape[0]
+            r = m["U"].shape[-1] if "U" in m else (m["A"].shape[-1] if "A" in m else 0)
+            # per query head and atom, counted from atom_read + the output sum (A^T A is
+            # query-independent and is not charged): q.mu + log n, weight x mu_v, softmax
+            per = 4 * d + 4
+            if m["order"] == 2:
+                per += 2 * r * d + 3 * d + 3 * r + 12                      # U^T q, q^2.diag, lam, phase, bound
+            if m["tilt"]:
+                per += 4 * r * d + d + 2 * r * r + 2 * r + 3               # B^T q, A (c tB), value-ball norm
+            f += per * na
+        total += rep * f
+    return total
+
+
+class EagerCount:
+    """
+    Explicit-matmul attention used ONLY inside the FLOP measurement of a native decode step:
+    torch's FlopCounterMode does not count every fused SDPA backend (e.g. the CPU flash
+    kernel), which would hide the attention cost.  One query token reads all cached keys.
+    """
+
+    def attend(self, module, q, k, v, mask, kwargs):
+        rep = q.shape[1] // k.shape[1]
+        att = (q @ rep_heads(k, rep).transpose(-1, -2)) * (kwargs.get("scaling") or module.scaling)
+        if isinstance(mask, torch.Tensor):
+            att = att.masked_fill(~mask, float("-inf")) if mask.dtype == torch.bool else att + mask
+        return (att.softmax(-1) @ rep_heads(v, rep)).transpose(1, 2).contiguous(), None
+
+
+def measured_step_flops(fn) -> float:
+    """torch.utils.flop_counter over one callable (None if unavailable)."""
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+        with FlopCounterMode(display=False) as fc:
+            fn()
+        return float(fc.get_total_flops())
+    except Exception:
+        return float("nan")
 
 
 # ── Generation with a compressed cache ──────────────────────────────────────────────
@@ -2479,36 +2765,173 @@ class DecodeCtl:
 
 @torch.no_grad()
 def generate(runner: "Runner", method: LayerMethod, ids: List[int], context_len: int, max_new: int,
-             stop_ids: set, stop_fn=None) -> Tuple[List[int], Dict]:
+             stop_ids: set, stop_fn=None, measure: bool = True) -> Tuple[List[int], Dict]:
     """
-    Greedy decoding.  One single-pass forward over the prompt with compression frozen at
-    context_len (state captured), then token-by-token steps that read the compressed state.
+    Greedy decoding on the reference harness.  One single-pass forward over the prompt with
+    compression frozen at context_len (state captured), then token-by-token steps that read
+    the compressed state.  Returns systems measurements (see "Systems measurements").
     """
-    t0 = time.time()
     P = len(ids)
     method.freeze_at, method.capture_extra = context_len, max_new + 1
+    kv_keep = {}
+    if measure and isinstance(method, KIVIMethod):            # raw K/V of the context for the payload
+        orig = method.entries
+
+        def entries_and_keep(li, q, k, v, scaling, pos, _o=orig):
+            kv_keep[li] = (k[:, :, :context_len], v[:, :, :context_len])
+            return _o(li, q, k, v, scaling, pos)
+        method.entries = entries_and_keep
+    _reset_peak()
+    _sync()
+    t0 = time.perf_counter()
     logits = runner.forward(torch.tensor([ids], device=DEVICE), method, logits_to_keep=1).logits[0, -1]
+    nxt = int(logits.float().argmax())
+    _sync()
+    prefill_s = time.perf_counter() - t0
+    peak_prefill = _peak()
     method.capture_extra = None
     states = method.states
     mem = method.state_bits(runner.d, context_len)
     full_bits = context_len * runner.L * runner.Hkv * 2 * runner.d * 16.0
+    info = {"memory_fraction": mem["total"] / full_bits, "analytic_bytes": mem["total"] / 8.0,
+            "full_cache_bytes": full_bits / 8.0, "prompt_len": P, "context_len": context_len,
+            "prefill_s": prefill_s, "ttft_s": prefill_s, "peak_prefill_bytes": peak_prefill,
+            "path": "harness", "model_dtype": str(next(runner.model.parameters()).dtype),
+            "attention_dtype": "float32 (reference harness)"}
+    if measure:
+        info["payload_bytes"] = payload_bytes(method, kv_keep, context_len)
+        info["sim_state_bytes"] = tensor_bytes([[st.K[:, :, :st.n], st.V[:, :, :st.n], st.tok, st.mom]
+                                                for st in states.values() if st.shared is None])
+        info["attn_flops_per_token"] = attn_flops_per_token(method, runner.Hq, runner.d)
+        info["attn_flops_per_token_full"] = (4.0 * runner.d + 5) * P * runner.Hq * runner.L
     ctl = DecodeCtl(states, runner.cfg)
     out = []
-    nxt = int(logits.float().argmax())
+    _reset_peak()
+    _sync()
+    t1 = time.perf_counter()
     for i in range(max_new):
         out.append(nxt)
         if nxt in stop_ids or i == max_new - 1 or (stop_fn is not None and stop_fn(out)):
             break
         pos = torch.tensor([P + i], device=DEVICE)
         ctl.begin(pos)
-        with routed(ctl):
-            lg = runner.model(input_ids=torch.tensor([[nxt]], device=DEVICE), position_ids=pos[None],
-                              use_cache=False).logits[0, -1]
+
+        def step(_n=nxt, _p=pos):
+            with routed(ctl):
+                return runner.model(input_ids=torch.tensor([[_n]], device=DEVICE), position_ids=_p[None],
+                                    use_cache=False).logits[0, -1]
+        if measure and i == 0 and runner.cfg.MEASURE_FLOPS:
+            snapshot = {li: st.n for li, st in states.items()}
+            info["flops_decode_step_measured"] = measured_step_flops(step)
+            for li, st in states.items():                           # undo the measured step's append
+                st.n = snapshot[li]
+        lg = step()
         nxt = int(lg.float().argmax())
+    _sync()
+    decode_s = time.perf_counter() - t1
+    info.update(n_generated=len(out), decode_s=decode_s, peak_decode_bytes=_peak(),
+                tokens_per_s=(len(out) - 1) / decode_s if len(out) > 1 and decode_s > 0 else float("nan"),
+                seconds=prefill_s + decode_s)
     method.states = {}
+    if "entries" in method.__dict__:
+        del method.entries
     free_memory()
-    return out, {"memory_fraction": mem["total"] / full_bits, "prompt_len": P, "context_len": context_len,
-                 "n_generated": len(out), "seconds": time.time() - t0}
+    return out, info
+
+
+@torch.no_grad()
+def native_generate(runner: "Runner", ids: List[int], context_len: int, max_new: int, stop_ids: set,
+                    stop_fn=None, press=None, nominal_keep: Optional[float] = None) -> Tuple[List[int], Dict]:
+    """
+    Hugging Face SDPA + DynamicCache path, optionally with an OFFICIAL kvpress press.  Mirrors
+    kvpress' KVPressTextGenerationPipeline._forward / generate_answer (v0.5.5): the context is
+    prefilled through model.model under the press, then question tokens at positions
+    context_len.. and greedy decoding read the (compressed) cache.  Same token ids as the harness.
+    """
+    from transformers import DynamicCache
+    if Router.active is not None:
+        raise RuntimeError("native path must run without an active harness controller")
+    model = runner.model
+    ctx = torch.tensor([ids[:context_len]], device=DEVICE)
+    qst = torch.tensor([ids[context_len:]], device=DEVICE)
+    cache = DynamicCache()
+    _reset_peak()
+    _sync()
+    t0 = time.perf_counter()
+    with (press(model) if press is not None else nullcontext()):
+        h = model.model(input_ids=ctx, past_key_values=cache).last_hidden_state
+    _sync()
+    prefill_s = time.perf_counter() - t0
+    peak_prefill = _peak()
+    lens = [cache.get_seq_length(li) for li in range(runner.L)]
+    cache_bytes = sum(tensor_bytes([lay.keys, lay.values]) for lay in cache.layers)
+    t1 = time.perf_counter()
+    if qst.shape[1] > 0:
+        pos = torch.arange(context_len, context_len + qst.shape[1], device=DEVICE)[None]
+        logits = model(input_ids=qst, past_key_values=cache, position_ids=pos, logits_to_keep=1).logits[0, -1]
+        pos = pos[:, -1:] + 1
+    else:
+        logits = model.get_output_embeddings()(h[0, -1])
+        pos = torch.tensor([[context_len]], device=DEVICE)
+    nxt = int(logits.float().argmax())
+    _sync()
+    ttft_s = prefill_s + time.perf_counter() - t1
+    full_bytes = context_len * runner.L * runner.Hkv * 2 * runner.d * 2
+    measured_fraction = sum(lens) / (runner.L * context_len)
+    info = {"prompt_len": len(ids), "context_len": context_len, "prefill_s": prefill_s, "ttft_s": ttft_s,
+            "peak_prefill_bytes": peak_prefill, "path": "native", "full_cache_bytes": float(full_bytes),
+            "model_dtype": str(next(model.parameters()).dtype), "attention_dtype": "model dtype (SDPA)",
+            "cache_bytes_measured": float(cache_bytes),
+            "memory_fraction": nominal_keep if nominal_keep is not None else measured_fraction,
+            "memory_fraction_measured": measured_fraction,
+            "attn_flops_per_token": (4.0 * runner.d + 5) * runner.Hq * (sum(lens) + runner.L * (len(ids) - context_len)),
+            "attn_flops_per_token_full": (4.0 * runner.d + 5) * len(ids) * runner.Hq * runner.L}
+    out = []
+    _reset_peak()
+    _sync()
+    t2 = time.perf_counter()
+    for i in range(max_new):
+        out.append(nxt)
+        if nxt in stop_ids or i == max_new - 1 or (stop_fn is not None and stop_fn(out)):
+            break
+        if i == 0 and runner.cfg.MEASURE_FLOPS:
+            snap = [(lay.keys, lay.values) for lay in cache.layers]
+            with routed(EagerCount()):                    # explicit matmuls: counted by torch
+                info["flops_decode_step_measured"] = measured_step_flops(
+                    lambda: model(input_ids=torch.tensor([[nxt]], device=DEVICE), past_key_values=cache,
+                                  position_ids=pos))
+            for lay, (kk, vv) in zip(cache.layers, snap):           # undo the measured step's append
+                lay.keys, lay.values = kk, vv
+        lg = model(input_ids=torch.tensor([[nxt]], device=DEVICE), past_key_values=cache, position_ids=pos).logits[0, -1]
+        pos = pos + 1
+        nxt = int(lg.float().argmax())
+    _sync()
+    decode_s = time.perf_counter() - t2
+    info.update(n_generated=len(out), decode_s=decode_s, peak_decode_bytes=_peak(),
+                tokens_per_s=(len(out) - 1) / decode_s if len(out) > 1 and decode_s > 0 else float("nan"),
+                seconds=ttft_s + decode_s, payload_bytes=float(cache_bytes))
+    del cache
+    free_memory()
+    return out, info
+
+
+def run_spec(runner, spec: BenchSpec, enc: Dict, max_new: int, stop: set, stop_fn, cfg) -> Tuple[List[int], Dict, str]:
+    """One (sample, method) generation on the right path."""
+    if spec.family == "native":
+        gen, info = native_generate(runner, enc["ids"], enc["context_len"], max_new, stop, stop_fn)
+        return gen, info, ""
+    if spec.family == "kvpress":
+        nominal = max(1, int(enc["context_len"] * spec.keep)) / enc["context_len"]
+        try:
+            press = build_press(spec.press, spec.keep)
+            gen, info = native_generate(runner, enc["ids"], enc["context_len"], max_new, stop, stop_fn, press,
+                                        nominal_keep=nominal if spec.press in MASKING_PRESSES else None)
+        except Exception as e:                        # e.g. SnapKV asserts context > window
+            return [], {"memory_fraction": float("nan"), "path": "native"}, f"kvpress error: {e!r}"[:200]
+        return gen, info, ("masked keys: nominal memory" if spec.press in MASKING_PRESSES else "")
+    method, note = make_method(spec, enc["context_len"], runner, cfg)
+    gen, info = generate(runner, method, enc["ids"], enc["context_len"], max_new, stop, stop_fn)
+    return gen, info, note
 
 
 def stop_ids_for(runner: "Runner") -> set:
@@ -2529,9 +2952,13 @@ def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[i
     cache it must also match Hugging Face's own cached greedy generate().
     """
     rows = []
+    harness_gen = {}
     for spec in specs:
+        if spec.family in ("native", "kvpress"):
+            continue
         m, note = make_method(spec, context_len, runner, cfg)
         gen, _ = generate(runner, m, ids, context_len, n_new, set())
+        harness_gen[spec.name] = gen
         ref_m, _ = make_method(spec, context_len, runner, cfg)
         ref_m.freeze_at = context_len
         x = torch.tensor([ids + gen[:-1]], device=DEVICE)
@@ -2545,11 +2972,51 @@ def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[i
         m, _ = make_method(BenchSpec("full", "full"), context_len, runner, cfg)
         gen, _ = generate(runner, m, ids, context_len, n_new, set())
         full[0]["hf_generate_agreement"] = float(np.mean([a == b for a, b in zip(gen, hf)]))
+    for spec in specs:
+        if spec.family not in ("native", "kvpress"):
+            continue
+        press = build_press(spec.press, spec.keep) if spec.family == "kvpress" else None
+        gen, _ = native_generate(runner, ids, context_len, n_new, set(), press=press)
+        row = {"method": spec.name, "n_tokens": len(gen), "note": "native path"}
+        # harness counterpart: full (fp32 harness vs model-dtype SDPA) and the SnapKV /
+        # StreamingLLM replicas vs the official presses (same kept set => same tokens)
+        twin = "full" if spec.family == "native" else \
+            {"snapkv": "snapkv", "streaming_llm": "streamingllm"}.get(spec.press, "") + f"@{spec.keep:g}"
+        if twin in harness_gen:
+            row["harness_agreement"] = float(np.mean([a == b for a, b in zip(gen, harness_gen[twin])]))
+            row["harness_twin"] = twin
+        row.update(official_pipeline_agreement(runner, ids, context_len, n_new, spec))
+        rows.append(row)
     df = pd.DataFrame(rows)
     logger.info("  generation equivalence: " + ", ".join(
-        f"{r.method}={r.argmax_agreement:.3f}" for r in df.itertuples()) +
+        f"{r['method']}={r.get('argmax_agreement', r.get('harness_agreement', float('nan'))):.3f}"
+        for r in rows) +
         (f"; full vs HF generate {full[0]['hf_generate_agreement']:.3f}" if full else ""))
     return df
+
+
+@torch.no_grad()
+def official_pipeline_agreement(runner: "Runner", ids, context_len, n_new, spec: BenchSpec) -> Dict:
+    """
+    native_generate must reproduce kvpress' own KVPressTextGenerationPipeline._forward (same
+    context / question ids, same press, its EOS-only stopping); 1.0 = identical decoded answer.
+    """
+    if not kvpress_available():
+        return {}
+    from kvpress import KVPressTextGenerationPipeline
+    pipe = KVPressTextGenerationPipeline(model=runner.model, tokenizer=runner.tokenizer)
+    eos = runner.model.generation_config.eos_token_id
+    eos = set(eos) if isinstance(eos, (list, tuple)) else ({int(eos)} if eos is not None else set())
+    q = ids[context_len:]
+    if not q:                                         # the official pipeline needs question tokens
+        return {"official_pipeline_agreement": float("nan")}
+    press = build_press(spec.press, spec.keep) if spec.family == "kvpress" else None
+    ans = pipe._forward({"context_ids": torch.tensor([ids[:context_len]]),
+                         "questions_ids": [torch.tensor([q])]}, max_new_tokens=n_new, press=press)[0]
+    press = build_press(spec.press, spec.keep) if spec.family == "kvpress" else None
+    gen, _ = native_generate(runner, ids, context_len, n_new, eos, press=press)
+    mine = runner.tokenizer.decode(gen, skip_special_tokens=True)
+    return {"official_pipeline_agreement": float(mine == ans)}
 
 
 # ── Benchmark evaluation ────────────────────────────────────────────────────────────
@@ -2603,7 +3070,9 @@ def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequen
         pred_dir = os.path.join(out_dir, "pred", bench)
         for it in sub:
             max_new = max_new_of(it)
+            t_tok = time.perf_counter()
             enc = encode_item(runner, it, max_new, cfg, chat_ok)
+            tokenize_s = time.perf_counter() - t_tok
             first_line = task in LB_FIRST_LINE_TASKS and bench.startswith("longbench")
 
             def stop_fn(gen, _tok=runner.tokenizer):
@@ -2612,14 +3081,13 @@ def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequen
                 key = (bench, task, str(it["id"]), spec.name)
                 if key in done:
                     continue
-                method, note = make_method(spec, enc["context_len"], runner, cfg)
-                gen, info = generate(runner, method, enc["ids"], enc["context_len"], max_new, stop, stop_fn)
+                gen, info, note = run_spec(runner, spec, enc, max_new, stop, stop_fn, cfg)
                 pred = runner.tokenizer.decode(gen, skip_special_tokens=True)
-                score = scorer(it, pred)
+                score = float("nan") if note.startswith("kvpress error") else scorer(it, pred)
                 rows.append({"benchmark": bench, "task": task, "item": str(it["id"]), "method": spec.name,
                              "family": spec.family if spec.family != "chunk" else spec.chunk.family,
-                             "keep_budget": spec.keep, "score": score, "note": note,
-                             "truncated": enc["truncated"], "chat": enc["chat"], **info})
+                             "keep_budget": spec.keep, "score": score, "note": note, "length": it.get("length"),
+                             "truncated": enc["truncated"], "chat": enc["chat"], "tokenize_s": tokenize_s, **info})
                 os.makedirs(os.path.join(pred_dir, spec.name), exist_ok=True)
                 with open(os.path.join(pred_dir, spec.name, f"{task}.jsonl"), "a", encoding="utf-8") as f:
                     f.write(json.dumps({"pred": pred, "answers": it["answers"], "all_classes": it.get("all_classes"),
@@ -2692,33 +3160,99 @@ def bench_contrasts(cfg: "Config") -> List[Tuple[str, str, str]]:
     out += [(f"freezing@{t0}", f"tilt@{t0}", f"tilt_nophase@{t0}"),
             (f"variance@{t0}", f"tilt@{t0}", f"moment1@{t0}")]
     out += [(f"tilt@{t0}_vs_kivi{b}", f"tilt@{t0}", f"kivi{b}") for b in cfg.KIVI_BITS]
+    presses = [s_.press for s_ in bench_specs(cfg) if s_.family == "kvpress" and s_.keep == cfg.KEEP_FRACTIONS[0]]
+    for r in cfg.KEEP_FRACTIONS:                   # official kvpress implementations (SOTA baselines)
+        t = f"{r:g}"
+        out += [(f"tilt_vs_kvpress:{pn}@{t}", f"tilt@{t}", f"kvpress:{pn}@{t}") for pn in presses]
+        if "snapkv" in presses:                    # replica vs official SnapKV (harness check)
+            out.append((f"{HARNESS_CHECK}snapkv@{t}", f"snapkv@{t}", f"kvpress:snapkv@{t}"))
+    out.append((f"{HARNESS_CHECK}full", "full", "native_full"))
     return out
 
 
-def paired_score_test(a: pd.DataFrame, b: pd.DataFrame, n_boot: int, n_perm: int, seed: int) -> Dict:
-    """Higher is better.  Per-unit paired difference A - B; bootstrap CI; sign-flip p."""
-    m = a.merge(b, on="unit", suffixes=("_a", "_b"))
-    d = (m.score_a - m.score_b).to_numpy()
+HARNESS_CHECK = "harness_check:"    # two-sided implementation checks; never enter decision rules
+
+
+def paired_score_test(d: np.ndarray, strata: np.ndarray, n_boot: int, n_perm: int, seed: int) -> Dict:
+    """
+    Higher is better.  d = per-unit paired differences A - B; strata = task of each unit.
+    The estimand is the benchmark's official aggregate: the MACRO mean over tasks of the
+    per-task mean difference (LongBench / RULER average task scores).  CI: bootstrap that
+    resamples units within each task; p: two-sided paired sign-flip test of the same statistic
+    (exact under H0 of exchangeable signs within units).
+    """
+    nan = float("nan")
     if len(d) == 0:
-        return {"estimate": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
-                "p_value": float("nan"), "n_units": 0}
+        return {"estimate": nan, "ci_low": nan, "ci_high": nan, "p_value": nan, "n_units": 0, "n_tasks": 0}
+    tasks = np.unique(strata)
+    idx = [np.flatnonzero(strata == t) for t in tasks]
+    w = np.zeros(len(d))
+    for ix in idx:                                       # macro weights: 1 / (n_tasks * n_task)
+        w[ix] = 1.0 / (len(tasks) * len(ix))
+    est = float((w * d).sum())
     rng = np.random.default_rng(seed)
-    boot = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(1)
-    null = (rng.choice([-1.0, 1.0], size=(n_perm, len(d))) * d).mean(1)
-    p = (1 + np.sum(np.abs(null) >= abs(d.mean()) - 1e-12)) / (n_perm + 1)
-    return {"estimate": float(d.mean()), "ci_low": float(np.percentile(boot, 2.5)),
-            "ci_high": float(np.percentile(boot, 97.5)), "p_value": float(p), "n_units": len(d)}
+    boot = np.zeros(n_boot)
+    for ix in idx:
+        boot += d[ix][rng.integers(0, len(ix), size=(n_boot, len(ix)))].mean(1) / len(tasks)
+    null = (rng.choice([-1.0, 1.0], size=(n_perm, len(d))) * (w * d)).sum(1)
+    p = (1 + np.sum(np.abs(null) >= abs(est) - 1e-12)) / (n_perm + 1)
+    return {"estimate": est, "ci_low": float(np.percentile(boot, 2.5)), "ci_high": float(np.percentile(boot, 97.5)),
+            "p_value": float(p), "n_units": len(d), "n_tasks": len(tasks)}
+
+
+LB_E_BUCKETS = ((0, 4000, "0-4k"), (4000, 8000, "4-8k"), (8000, BIG, "8k+"))   # official eval.py scorer_e
+SYSTEMS_COLS = ("tokenize_s", "prefill_s", "ttft_s", "decode_s", "tokens_per_s", "peak_prefill_bytes",
+                "peak_decode_bytes", "payload_bytes", "analytic_bytes", "sim_state_bytes", "cache_bytes_measured",
+                "full_cache_bytes", "attn_flops_per_token", "attn_flops_per_token_full",
+                "flops_decode_step_measured", "memory_fraction", "memory_fraction_measured")
 
 
 def bench_analysis(df: pd.DataFrame, cfg: "Config", model: str, family: str, out_dir: str) -> pd.DataFrame:
-    """Task scores (official aggregation) and pre-specified paired contrasts per benchmark."""
+    """
+    Task scores (official aggregation: per-task mean, macro average over tasks; LongBench-E
+    also per length bucket), systems measurements, and pre-specified paired contrasts.
+    A contrast uses only BUDGET-COMPLIANT units: at a shared budget both methods store
+    <= KEEP (1 + BUDGET_TOL) on that sample; against an unbudgeted code (KIVI) memory_A <=
+    memory_B (1 + BUDGET_TOL).  No method wins by holding more cache; excluded units are
+    counted and the all-unit estimate is reported beside it.  Undefined scores are dropped.
+    """
     if df.empty:
         return df
+    df = df[df.score.notna()].copy()
+    df["note"] = df.note.fillna("").astype(str) if "note" in df else ""
     agg = df.groupby(["benchmark", "task", "method"], as_index=False).agg(
         score=("score", "mean"), n=("score", "size"), memory_fraction=("memory_fraction", "mean"),
-        over_budget=("note", lambda s: float((s.fillna("").astype(str).str.len() > 0).mean())))
+        flagged=("note", lambda s_: float((s_.str.len() > 0).mean())))
+    parts = [agg]
+    for bench, g in agg[~agg.benchmark.str.startswith("longppl")].groupby("benchmark"):
+        n_tasks = g.task.nunique()
+        mac = g.groupby("method", as_index=False).agg(score=("score", "mean"), n=("n", "sum"),
+                                                      memory_fraction=("memory_fraction", "mean"),
+                                                      flagged=("flagged", "mean"), n_t=("task", "nunique"))
+        mac = mac[mac.n_t == n_tasks].drop(columns="n_t")      # macro only over complete task sets
+        parts.append(mac.assign(benchmark=bench, task="macro_avg"))
+    if "length" in df and df.benchmark.str.startswith("longbench-e").any():
+        e = df[df.benchmark.str.startswith("longbench-e") & df.length.notna()]
+        for lo, hi, lab in LB_E_BUCKETS:
+            b = e[(e.length >= lo) & (e.length < hi)]
+            if len(b):
+                parts.append(b.groupby(["benchmark", "task", "method"], as_index=False).agg(
+                    score=("score", "mean"), n=("score", "size"), memory_fraction=("memory_fraction", "mean"))
+                    .assign(task=lambda x, _l=lab: x.task + f"[{_l}]"))
+    agg = pd.concat(parts, ignore_index=True)
     agg.insert(0, "model", model)
     agg.to_csv(os.path.join(out_dir, "bench_task_scores.csv"), index=False)
+
+    sys_cols = [c_ for c_ in SYSTEMS_COLS if c_ in df]
+    if sys_cols:
+        gen = df[~df.benchmark.str.startswith("longppl")]
+        sysd = gen.groupby(["benchmark", "method"], as_index=False)[sys_cols].median(numeric_only=True)
+        if "path" in gen:
+            sysd = sysd.merge(gen.groupby(["benchmark", "method"], as_index=False).path.first(), on=["benchmark", "method"])
+        sysd.insert(0, "model", model)
+        sysd["statistic"] = "median over samples"
+        sysd.to_csv(os.path.join(out_dir, "bench_systems.csv"), index=False)
+
     rows = []
     for bench, g in df.groupby("benchmark"):
         lm = bench.startswith("longppl")
@@ -2728,18 +3262,38 @@ def bench_analysis(df: pd.DataFrame, cfg: "Config", model: str, family: str, out
             ga, gb = g[g.method == A], g[g.method == B]
             if ga.empty or gb.empty:
                 continue
-            r = paired_score_test(ga[["unit", "score"]], gb[["unit", "score"]], cfg.N_BOOT, cfg.N_PERM, SEED)
+            m = ga[["unit", "task", "score", "memory_fraction", "keep_budget"]].merge(
+                gb[["unit", "score", "memory_fraction", "keep_budget"]], on="unit", suffixes=("_a", "_b"))
+            check = name.startswith(HARNESS_CHECK)
+            tol = 1 + cfg.BUDGET_TOL
+            if check:
+                ok = np.ones(len(m), bool)
+            elif m.keep_budget_a.notna().all() and m.keep_budget_b.notna().all():   # same budget: both within it
+                ok = ((m.memory_fraction_a <= m.keep_budget_a * tol + 1e-9) &
+                      (m.memory_fraction_b <= m.keep_budget_b * tol + 1e-9)).to_numpy()
+            else:                                       # vs an unbudgeted code (KIVI): A no larger than B
+                ok = (m.memory_fraction_a <= m.memory_fraction_b * tol + 1e-9).to_numpy()
+            d = (m.score_a - m.score_b).to_numpy()
+            strata = m.task.astype(str).to_numpy()
+            r = paired_score_test(d[ok], strata[ok], cfg.N_BOOT, cfg.N_PERM, SEED)
+            r_all = paired_score_test(d, strata, 1, 1, SEED)
             rows.append({"model": model, "model_family": family, "benchmark": bench, "contrast": name, "A": A,
-                         "B": B, "memory_A": ga.memory_fraction.mean(), "memory_B": gb.memory_fraction.mean(),
-                         "score_A": ga.score.mean(), "score_B": gb.score.mean(), **r})
+                         "B": B, "role": "check" if check else "hypothesis",
+                         "memory_A": float(m.memory_fraction_a[ok].mean()) if ok.any() else float("nan"),
+                         "memory_B": float(m.memory_fraction_b[ok].mean()) if ok.any() else float("nan"),
+                         "score_A": float(m.score_a[ok].mean()) if ok.any() else float("nan"),
+                         "score_B": float(m.score_b[ok].mean()) if ok.any() else float("nan"),
+                         "n_excluded_over_budget": int((~ok).sum()), "estimate_all_units": r_all["estimate"], **r})
     ct = pd.DataFrame(rows)
     if len(ct):
         ct["p_holm"] = np.nan
-        for bench, idx in ct.groupby("benchmark").groups.items():
+        hyp = ct.role == "hypothesis"
+        for bench, idx in ct[hyp].groupby("benchmark").groups.items():
             ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value"])
-        ct["memory_ok"] = ct.memory_A <= ct.memory_B * (1 + cfg.BUDGET_TOL) + 1e-9
-        ct["supported"] = (ct.estimate > 0) & (ct.p_holm < cfg.ALPHA) & ct.memory_ok
+        ct["supported"] = hyp & (ct.estimate > 0) & (ct.p_holm < cfg.ALPHA) & (ct.n_units > 0)
         ct.to_csv(os.path.join(out_dir, "bench_contrasts.csv"), index=False)
+        for r in ct[~hyp].itertuples():
+            logger.info(f"  {r.benchmark} {r.contrast}: diff={r.estimate:+.3f} p={r.p_value:.3g} (two-sided check)")
     return ct
 
 
@@ -2749,6 +3303,11 @@ def bench_cross_model(cfg: "Config"):
         return
     ct = pd.concat(cts, ignore_index=True)
     ct.to_csv(os.path.join(cfg.OUTPUT_DIR, "bench_all_contrasts.csv"), index=False)
+    if "role" in ct:                                        # harness checks never enter decisions
+        ct = ct[ct.role == "hypothesis"]
+    sysd = [pd.read_csv(p) for p in Path(cfg.RESULTS_DIR).glob("*/bench/bench_systems.csv")]
+    if sysd:
+        pd.concat(sysd, ignore_index=True).to_csv(os.path.join(cfg.OUTPUT_DIR, "bench_all_systems.csv"), index=False)
     scores = [pd.read_csv(p) for p in Path(cfg.RESULTS_DIR).glob("*/bench/bench_task_scores.csv")]
     if scores:
         pd.concat(scores, ignore_index=True).to_csv(os.path.join(cfg.OUTPUT_DIR, "bench_all_task_scores.csv"), index=False)
@@ -2786,7 +3345,8 @@ def run_bench_model(mc: "ModelConfig", cfg: "Config", suites: Sequence[str], pre
     enc = encode_item(runner, probe, 8, cfg)
     eq_specs = [s for s in bench_specs(cfg) if s.name in
                 ("full", "kivi2", f"snapkv@{cfg.PRIMARY_KEEP:g}", f"streamingllm@{cfg.PRIMARY_KEEP:g}",
-                 f"tilt@{cfg.PRIMARY_KEEP:g}", f"am@{cfg.PRIMARY_KEEP:g}", f"mean@{cfg.PRIMARY_KEEP:g}")]
+                 f"tilt@{cfg.PRIMARY_KEEP:g}", f"am@{cfg.PRIMARY_KEEP:g}", f"mean@{cfg.PRIMARY_KEEP:g}",
+                 "native_full", f"kvpress:snapkv@{cfg.PRIMARY_KEEP:g}", f"kvpress:streaming_llm@{cfg.PRIMARY_KEEP:g}")]
     generation_equivalence(runner, eq_specs, enc["ids"], enc["context_len"], 8, cfg).to_csv(
         os.path.join(out_dir, "generation_equivalence.csv"), index=False)
     if synthetic:                      # positive control: gold answers must score 100 end to end
