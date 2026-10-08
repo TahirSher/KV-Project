@@ -130,11 +130,49 @@ key, a value and a query-INDEPENDENT log-mass:
   global      full cache, KIVI-2/4 (Liu et al. 2024), training-free CLA (KV_LDT_v12_2 `full`)
   Re-implementations of others' methods are simplified ("-like"/"-lite"); state this.
 
+════════════════════════════════════════════════════════════════════════════════════════
+5. LONG-CONTEXT BENCHMARKS (Hugging Face datasets; --suite longbench ruler longppl)
+════════════════════════════════════════════════════════════════════════════════════════
+  LongBench   Xnhyacinth/LongBench (parquet; NVIDIA kvpress' conversion of THUDM/LongBench);
+              fallback: the official data.zip of zai-org/THUDM LongBench read directly (the
+              loading script no longer runs with datasets >= 4).  Default tasks: qasper,
+              hotpotqa, trec, repobench-p (any English task, --tasks; LongBench-E with
+              --longbench-e).  Prompts = official THUDM templates split into context /
+              question / answer prefix (verified identical to the official prompts),
+              official generation lengths, official metrics (qa-F1, classification,
+              code-sim, ROUGE-L, retrieval, count) and first-line post-processing, official
+              no-chat-template tasks, middle truncation at MAX_CONTEXT_TOKENS.
+  RULER       simonjegou/ruler (kvpress), data_dir = context length (4096 / 8192 / 16384 ...);
+              13 tasks; string_match_all / string_match_part (qa_*) as in RULER and kvpress.
+  Long PPL    allenai/c4 (validation shard, documents concatenated) and emozilla/pg19-test
+              (PG-19 books); streaming single pass of LONG_PPL_LEN tokens; NLL by position.
+  Protocol    the context is prefilled and compressed, compression is FROZEN at the end of
+              the context, question + answer prefix + generated tokens are kept exact for
+              every method (kvpress' compress-the-context protocol; --query-aware also
+              compresses the question).  Greedy decoding runs token by token from the
+              captured compressed state (LayerState); generation_equivalence() checks it
+              against a single pass and, for the full cache, against HF generate().
+  Memory      matched PER SAMPLE: every compressed method stores <= KEEP x the fp16 context
+              cache (KEEP_FRACTIONS = 1/4, 1/8, 1/16); the stored fraction is measured from
+              the captured state and reported per sample.  Baselines: full cache, KIVI-2/4,
+              SnapKV (Li et al., 2024; pooling kernel 7, window 32), StreamingLLM (Xiao et al.,
+              2024), chunk-local eviction / mean merge / Attention-Matching-lite, ablations.
+  Outputs     results/<model>/bench/: bench_samples.csv (per sample x method), task scores,
+              paired contrasts (sign-flip test on per-sample scores, Holm per benchmark),
+              pred/<benchmark>/<method>/<task>.jsonl in the official LongBench eval.py format;
+              top level: bench_decision_rules.csv (cross-model rule).
+
 Usage
-    python TILT_KV.py --smoke                       # offline CPU test (tiny models)
-    python TILT_KV.py --models Llama-3.2-1B         # real model (GPU, Hugging Face access)
-Requires torch >= 2.4, transformers >= 4.56 (tested on 5.19), scipy, pandas,
-datasets (not with --smoke), matplotlib (optional).
+    python TILT_KV.py --smoke                                     # core suite, offline CPU
+    python TILT_KV.py --smoke --suite longbench ruler longppl     # benchmark engine, offline
+    python TILT_KV.py --models Llama-3.2-1B                       # core suite, real model
+    python TILT_KV.py --suite longbench ruler --models Llama-3.1-8B-Instruct \
+           --tasks qasper hotpotqa trec repobench-p --ruler-lengths 4096 8192 16384
+    python TILT_KV.py --suite longppl --models Llama-3.1-8B-Instruct --long-ppl-len 16384
+    Useful: --keep 0.25 0.125 --max-samples 50 --methods tilt@ snapkv@ streamingllm@ --query-aware
+Requires torch >= 2.4, transformers >= 4.56 (tested on 5.19), scipy, pandas, datasets and
+huggingface_hub (benchmarks), fuzzywuzzy or rapidfuzz (code tasks), rouge (summarisation
+tasks), matplotlib (optional).  Gated models (Llama) need `huggingface-cli login`.
 
 Validation status (be explicit in any write-up)
   Verified with --smoke only: CPU, two tiny models (Llama; SmolLM3 with NoPE layers)
@@ -154,6 +192,13 @@ Validation status (be explicit in any write-up)
     on this retrieval task.
   * Harness: fp32 simulation == SDPA (3e-6); streaming decoder == single pass (argmax
     100%, |dlogit| <= 9e-5, identical kept sets), with compacted exact tokens discarded.
+  * Benchmark engine (--smoke --suite longbench ruler longppl; tiny char-level model,
+    synthetic stand-ins): decoding from the compressed state reproduced the single pass
+    token for token for full, KIVI, SnapKV, StreamingLLM, TiltKV, mean, AM (agreement 1.000)
+    and matched HF generate() for the full cache; measured memory 0.24-0.25 at a 0.25
+    budget; gold answers score 100 through the whole pipeline; metric unit tests pass.
+  * NOT run: real Hugging Face datasets and real LLMs (this environment cannot reach the
+    Hub).  Dataset ids and columns follow kvpress' evaluation code; check the first run.
   No real-LLM result exists yet; every claim is a hypothesis for the decision rules.
 """
 import os
@@ -173,7 +218,7 @@ import time
 import zlib
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -326,10 +371,46 @@ class Config:
     RUN_LAMBADA: bool = True
     RUN_PASSKEY: bool = True
 
+    # ── Long-context benchmarks (Hugging Face) ────────────────────────
+    BENCH_MODELS: List[ModelConfig] = field(default_factory=lambda: [
+        ModelConfig("Llama-3.1-8B-Instruct", "meta-llama/Llama-3.1-8B-Instruct", "Llama", 1),
+        ModelConfig("Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-7B-Instruct", "Qwen", 1),
+        ModelConfig("Mistral-7B-Instruct-v0.3", "mistralai/Mistral-7B-Instruct-v0.3", "Mistral", 1),
+        ModelConfig("Qwen3-8B", "Qwen/Qwen3-8B", "Qwen", 1),
+        ModelConfig("Llama-3.2-3B-Instruct", "meta-llama/Llama-3.2-3B-Instruct", "Llama", 1),
+        ModelConfig("Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", "Qwen", 1),
+        ModelConfig("SmolLM3-3B", "HuggingFaceTB/SmolLM3-3B", "SmolLM", 1),
+        ModelConfig("Llama-3.2-1B-Instruct", "meta-llama/Llama-3.2-1B-Instruct", "Llama", 1),
+        ModelConfig("Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct", "Qwen", 1),
+    ])
+    LONGBENCH_HF: str = "Xnhyacinth/LongBench"          # kvpress' parquet conversion
+    LONGBENCH_ZIP_REPOS: Tuple[str, ...] = ("zai-org/LongBench", "THUDM/LongBench")   # official data.zip
+    LONGBENCH_TASKS: Tuple[str, ...] = ("qasper", "hotpotqa", "trec", "repobench-p")
+    LONGBENCH_E: bool = False                            # LongBench-E (length-balanced) variants
+    RULER_HF: str = "simonjegou/ruler"
+    RULER_LENGTHS: Tuple[int, ...] = (4096, 8192, 16384)
+    RULER_MAX_PER_TASK: Optional[int] = 100
+    LONG_PPL_DATASETS: Tuple[str, ...] = ("c4", "pg19")
+    LONG_PPL_LEN: int = 16384
+    LONG_PPL_N: int = 20
+    LONG_PPL_BINS: Tuple[int, ...] = (0, 1024, 4096, 8192)
+    C4_FILE: str = "en/c4-validation.00000-of-00008.json.gz"
+    PG19_HF: str = "emozilla/pg19-test"
+    KEEP_FRACTIONS: Tuple[float, ...] = (0.25, 0.125, 0.0625)   # 4x, 8x, 16x smaller context cache
+    PRIMARY_KEEP: float = 0.125
+    SNAPKV_KERNEL: int = 7
+    MAX_CONTEXT_TOKENS: int = 32000
+    QUERY_AWARE: bool = False                            # True: question is compressed with the context
+    USE_CHAT_TEMPLATE: bool = True
+    MAX_SAMPLES: Optional[int] = None                    # per task (None = all)
+    BENCH_INCLUDE_CLA: bool = False
+    BENCH_METHODS: Tuple[str, ...] = ()                  # name prefixes to run (empty = all); full always runs
+
     # ── Statistics ────────────────────────────────────────────────────
     N_BOOT: int = 2000
     N_PERM: int = 10000
     ALPHA: float = 0.05
+    BUDGET_TOL: float = 0.02                             # benchmarks: measured memory_A <= memory_B (1 + tol)
     DECISION_MIN_MODEL_FRACTION: float = 7.0 / 9.0
     MIN_MODELS_WILCOXON: int = 6
     RESUME: bool = True
@@ -344,6 +425,8 @@ class Config:
             raise ValueError("WINDOW >= KIVI_GROUP is required for a causal KIVI simulation")
         if self.PRIMARY_BITS not in self.TARGET_BITS:
             raise ValueError("PRIMARY_BITS must be one of TARGET_BITS")
+        if self.PRIMARY_KEEP not in self.KEEP_FRACTIONS:
+            raise ValueError("PRIMARY_KEEP must be one of KEEP_FRACTIONS")
         self.RESULTS_DIR = os.path.join(self.OUTPUT_DIR, "results")
         os.makedirs(self.RESULTS_DIR, exist_ok=True)
 
@@ -591,8 +674,10 @@ def finalize_chunk(k: torch.Tensor, v: torch.Tensor, qref: torch.Tensor, method:
     m = plan["tokens"]
     scores = torch.einsum("bhqd,bhcd->bhqc", qref, k)
     share = scores.softmax(-1).mean(2)                                  # within-chunk attention share
-    if method.selection == "random":
-        share = torch.as_tensor(_rng("randsel", *key).random((B, H, C)), device=k.device, dtype=k.dtype)
+    if method.selection == "random":                   # key: one tuple, or one tuple per stacked chunk
+        keys = key if isinstance(key, list) else [key]
+        share = torch.cat([torch.as_tensor(_rng("randsel", *kk).random((B // len(keys), H, C)), dtype=k.dtype)
+                           for kk in keys]).to(k.device)
     out = {"tok": None, "mom": None}
     if method.family == "am":
         idx = torch.topk(share, m, dim=-1).indices.sort(-1).values
@@ -718,13 +803,15 @@ def attention_matching(k, v, qref, scores, idx, cfg: "Config") -> Dict:
     return {"k": kk, "v": Vn, "b": w.clamp_min(1e-30).log()}
 
 
-def chunk_plan(T: int, cfg: "Config") -> List[Tuple[int, int, int]]:
-    """(start, end, tau) of every chunk that is compacted before the end of the sequence."""
+def chunk_plan(T: int, cfg: "Config", horizon: Optional[int] = None) -> List[Tuple[int, int, int]]:
+    """(start, end, tau) of every chunk compacted before position min(T, horizon) (the
+    horizon freezes compression at the end of a context; later tokens stay exact)."""
+    H = T if horizon is None else min(T, horizon)
     out, s = [], cfg.N_SINK
-    while s + cfg.CHUNK - 1 < T:
+    while s + cfg.CHUNK - 1 < H:
         e = s + cfg.CHUNK - 1
         tau = e + cfg.WINDOW
-        if tau > T - 1:
+        if tau > H - 1:
             break
         out.append((s, e, tau))
         s += cfg.CHUNK
@@ -752,6 +839,7 @@ def chunked_attention(q, scaling, q_pos, K, V, kv_pos, hide_at, tok, mom, chunk)
       exact tokens  (K, V at kv_pos), readable by query m iff kv_pos <= m < hide_at
       token atoms   logit q.k + b, value v, visible iff tau <= m
       moment atoms  logit / value from atom_read, visible iff tau <= m
+    hide_at is (Tk,) or per KV head (B, Hkv, Tk) (head-wise eviction such as SnapKV).
     q (B, Hq, Tq, d) -> out (B, Tq, Hq, d).
     """
     B, Hq, Tq, d = q.shape
@@ -759,6 +847,8 @@ def chunked_attention(q, scaling, q_pos, K, V, kv_pos, hide_at, tok, mom, chunk)
     Kr, Vr = rep_heads(K.float(), rep), rep_heads(V.float(), rep)
     dev = q.device
     kv_pos, hide_at = kv_pos.to(dev), hide_at.to(dev)
+    if hide_at.dim() == 3:
+        hide_at = rep_heads(hide_at, rep)[:, :, None, :]                # (B, Hq, 1, Tk)
     if tok is not None:
         tk, tv, tb = rep_heads(tok["k"], rep), rep_heads(tok["v"], rep), rep_heads(tok["b"], rep)
         ttau = tok["tau"].to(dev)
@@ -769,7 +859,8 @@ def chunked_attention(q, scaling, q_pos, K, V, kv_pos, hide_at, tok, mom, chunk)
     for s in range(0, Tq, chunk):
         qs = q[:, :, s:s + chunk].float() * scaling
         qp = q_pos[s:s + chunk].to(dev)
-        readable = (kv_pos[None, :] <= qp[:, None]) & (qp[:, None] < hide_at[None, :])
+        readable = (kv_pos[None, :] <= qp[:, None]) & (qp[:, None] < (hide_at if hide_at.dim() == 4
+                                                                       else hide_at[None, :]))
         blocks = [(qs @ Kr.transpose(-1, -2)).masked_fill(~readable, float("-inf"))]
         if tok is not None:
             blocks.append((qs @ tk.transpose(-1, -2) + tb[:, :, None]).masked_fill(
@@ -798,12 +889,59 @@ def chunked_attention(q, scaling, q_pos, K, V, kv_pos, hide_at, tok, mom, chunk)
 # LAYER METHODS (one object per evaluated configuration)
 # ════════════════════════════════════════════════════════════════════════════
 
+class LayerState:
+    """
+    Compressed cache of one layer after a (possibly frozen) prefill, ready for decoding:
+    exact rows in a pre-allocated buffer with per-KV-head liveness (hide), plus the visible
+    token atoms and moment atoms.  New tokens are appended exact (all methods), as in the
+    compress-the-context-once protocol of KV-compression benchmarks.
+    """
+
+    def __init__(self, K, V, pos, hide, tok, mom, extra: int, shared: Optional[int] = None):
+        B, H, n, d = K.shape
+        cap = n + extra
+        self.K = K.new_zeros((B, H, cap, d))
+        self.V = V.new_zeros((B, H, cap, d))
+        self.K[:, :, :n], self.V[:, :, :n] = K, V
+        self.pos = torch.full((cap,), BIG, dtype=torch.long, device=K.device)
+        self.pos[:n] = pos.to(K.device)
+        self.hide = torch.zeros((B, H, cap), dtype=torch.long, device=K.device)
+        self.hide[:, :, :n] = hide.to(K.device)
+        self.n, self.shared = n, shared
+        self.tok = None if tok is None else {**tok, "tau": torch.full_like(tok["tau"], -1)}
+        self.mom = None if mom is None else {**mom, "tau": torch.full_like(mom["tau"], -1)}
+
+    def append(self, k, v, pos):
+        t = k.shape[2]
+        if self.n + t > self.K.shape[2]:
+            raise RuntimeError("decode buffer exhausted")
+        self.K[:, :, self.n:self.n + t], self.V[:, :, self.n:self.n + t] = k, v
+        self.pos[self.n:self.n + t] = pos
+        self.hide[:, :, self.n:self.n + t] = BIG
+        self.n += t
+
+    def attend(self, q, scaling, qpos, chunk):
+        n = self.n
+        return chunked_attention(q, scaling, qpos, self.K[:, :, :n], self.V[:, :, :n], self.pos[:n],
+                                 self.hide[:, :, :n], self.tok, self.mom, chunk)
+
+
 class LayerMethod:
+    """
+    A KV-cache policy.  entries() returns the cache a layer reads during a single forward:
+    exact K/V with hide_at (when a row stops being readable) plus token / moment atoms.
+    freeze_at = H freezes compression at position H (benchmarks: the end of the context);
+    with capture_extra set, the state at the end of the forward is kept for decoding.
+    """
     name = "full"
     family = "global"
+    one_shot = False                # compresses once at the horizon (needs freeze_at)
 
     def __init__(self, cfg: "Config"):
         self.cfg = cfg
+        self.freeze_at: Optional[int] = None
+        self.capture_extra: Optional[int] = None
+        self.states: Dict[int, LayerState] = {}
 
     def bits_per_element(self, d: int) -> float:
         return 16.0
@@ -813,12 +951,52 @@ class LayerMethod:
         return 0
 
     def begin(self):
-        pass
+        self.states = {}
+
+    def horizon(self, T: int) -> int:
+        return T if self.freeze_at is None else min(T, self.freeze_at)
+
+    def entries(self, li, q, k, v, scaling, pos):
+        return k, v, torch.full((k.shape[2],), BIG, dtype=torch.long), None, None
+
+    def entry_bits(self, kind: str, d: int) -> float:
+        """Storage of one entry of a kind ('exact', 'tok', 'mom') per KV head, in bits."""
+        return 2 * d * 16.0 if kind == "exact" else 0.0
 
     def layer(self, li, q, k, v, scaling, pos) -> torch.Tensor:
-        n = k.shape[2]
-        return chunked_attention(q, scaling, pos, k, v, pos, torch.full((n,), BIG, dtype=torch.long),
-                                 None, None, self.cfg.ATTN_CHUNK)
+        K, V, hide, tok, mom = self.entries(li, q, k, v, scaling, pos)
+        if self.capture_extra is not None:
+            self.capture(li, K, V, pos, hide, tok, mom)
+        return chunked_attention(q, scaling, pos, K, V, pos, hide, tok, mom, self.cfg.ATTN_CHUNK)
+
+    def capture(self, li, K, V, pos, hide, tok, mom, shared=None):
+        T = K.shape[2]
+        B, H = K.shape[0], K.shape[1]
+        hide = hide.to(K.device)
+        hide = hide.expand(B, H, T) if hide.dim() == 1 else hide
+        live = hide >= BIG                                          # readable from now on
+        alive_hide = torch.where(live, torch.full_like(hide, BIG), torch.zeros_like(hide))
+        if tok is not None:                                         # keep atoms visible at T-1
+            vis = (tok["tau"].to(K.device) <= T - 1)
+            tok = {"k": tok["k"][:, :, vis], "v": tok["v"][:, :, vis], "b": tok["b"][:, :, vis],
+                   "tau": tok["tau"][vis.cpu()]}
+            if tok["k"].shape[2] == 0:
+                tok = None
+        self.states[li] = LayerState(K, V, pos, alive_hide, tok, mom, self.capture_extra, shared)
+
+    def state_bits(self, d: int, context_len: int) -> Dict[str, float]:
+        """Stored bits for the CONTEXT part of the captured state (all layers, KV heads)."""
+        exact = tok = mom = 0.0
+        for li, st in self.states.items():
+            if st.shared is not None:
+                continue
+            ctx = (st.pos[:st.n] < context_len)[None, None, :] & (st.hide[:, :, :st.n] >= BIG)
+            exact += float(ctx.sum()) * self.entry_bits("exact", d)
+            if st.tok is not None:
+                tok += float(torch.isfinite(st.tok["b"]).sum()) * self.entry_bits("tok", d)
+            if st.mom is not None:
+                mom += float(torch.isfinite(st.mom["logn"]).sum()) * self.entry_bits("mom", d)
+        return {"exact": exact, "tok": tok, "mom": mom, "total": exact + tok + mom}
 
 
 class KIVIMethod(LayerMethod):
@@ -834,17 +1012,24 @@ class KIVIMethod(LayerMethod):
     def exact_tokens(self):
         return self.cfg.N_SINK + self.cfg.WINDOW
 
-    def layer(self, li, q, k, v, scaling, pos):
+    def entry_bits(self, kind, d):
+        return 2 * d * (16.0 if kind == "exact" else self.cfg.kivi_effective_bits(self.bits))
+
+    def entries(self, li, q, k, v, scaling, pos):
         c = self.cfg
+        H = self.horizon(k.shape[2])
         kh = kivi_fake_quant(k, self.bits, c.KIVI_GROUP, True, c.N_SINK)
         vh = kivi_fake_quant(v, self.bits, c.KIVI_GROUP, False, c.N_SINK)
-        n = k.shape[2]
-        # exact for sinks and the window; quantised copies as token atoms visible elsewhere is
-        # expressed directly: exact tokens hidden once outside the window, quantised copy shown.
-        hide = torch.where(pos < c.N_SINK, torch.full_like(pos, BIG), pos + c.WINDOW).cpu()
-        tok = {"k": kh, "v": vh, "b": torch.zeros(kh.shape[:3], device=k.device), "tau": hide.clone()}
-        tok["b"][:, :, pos.cpu() < c.N_SINK] = float("-inf")
-        return chunked_attention(q, scaling, pos, k, v, pos, hide, tok, None, c.ATTN_CHUNK)
+        # a token is read exact until it leaves the window (n + W), then from its quantised
+        # copy; with a horizon H, tokens still inside the window at H stay exact for good
+        pc = pos.cpu()
+        q_at = pc + c.WINDOW
+        quant = (pc >= c.N_SINK) & (q_at <= H - 1)
+        hide = torch.where(quant, q_at, torch.full_like(pc, BIG))
+        b = torch.zeros(kh.shape[:3], device=k.device)
+        b[:, :, ~quant.to(k.device)] = float("-inf")
+        tok = {"k": kh, "v": vh, "b": b, "tau": torch.where(quant, q_at, torch.full_like(pc, BIG))}
+        return k, v, hide, tok, None
 
 
 def kivi_fake_quant(x, bits, group, along_tokens, n_sink):
@@ -885,6 +1070,7 @@ class CLAMethod(LayerMethod):
         return 16.0 * (1 - len(self.map) / self.L)
 
     def begin(self):
+        super().begin()
         self.cache = {}
 
     def layer(self, li, q, k, v, scaling, pos):
@@ -892,7 +1078,10 @@ class CLAMethod(LayerMethod):
             self.cache[li] = (k, v)
         if li in self.map:
             k, v = self.cache[self.map[li]]
-        return super().layer(li, q, k, v, scaling, pos)
+        K, V, hide, tok, mom = LayerMethod.entries(self, li, q, k, v, scaling, pos)
+        if self.capture_extra is not None:
+            self.capture(li, K, V, pos, hide, tok, mom, shared=self.map.get(li))
+        return chunked_attention(q, scaling, pos, K, V, pos, hide, tok, mom, self.cfg.ATTN_CHUNK)
 
 
 class ChunkedMethod(LayerMethod):
@@ -913,29 +1102,138 @@ class ChunkedMethod(LayerMethod):
     def exact_tokens(self):
         return self.cfg.N_SINK + self.cfg.WINDOW + self.cfg.CHUNK - 1
 
-    def build(self, li, q, k, v, scaling, plan_T):
-        """Finalise every chunk of this layer (single pass); returns atoms and hide_at."""
-        c = self.cfg
-        Hkv = k.shape[1]
-        n = k.shape[2]
-        hide = torch.full((n,), BIG, dtype=torch.long)
-        parts = []
-        for ci, (s, e, tau) in enumerate(plan_T):
-            qref = group_queries(q[:, :, max(0, tau - c.W_OBS + 1): tau + 1].float() * scaling, Hkv)
-            res = finalize_chunk(k[:, :, s:e + 1].float(), v[:, :, s:e + 1].float(), qref, self.m,
-                                 self.plan, c.KEEP_BITS, c, (li, ci))
-            if self.record and res["tok"] is not None and res["tok"].get("idx") is not None:
-                self.kept[(li, ci)] = res["tok"]["idx"].cpu()
-            if res["tok"] is not None and "use_atoms" in res["tok"]:
-                self.atom_use.append(float(res["tok"]["use_atoms"].float().mean()))
-            parts.append((res, tau))
-            hide[s:e + 1] = tau
-        return concat_atoms(parts, "tok"), concat_atoms(parts, "mom"), hide
+    def entry_bits(self, kind, d):
+        if kind == "exact":
+            return 2 * d * 16.0
+        if kind == "mom":
+            return 16.0 * atom_floats(self.m, d)
+        if self.m.family == "mean":       # tails are token-like; the mean atom is stored as one too
+            return token_bits(d, self.cfg.KEEP_BITS)
+        return token_bits(d, self.cfg.KEEP_BITS) + (16 if self.m.family == "am" else 0)
 
-    def layer(self, li, q, k, v, scaling, pos):
-        plan_T = chunk_plan(k.shape[2], self.cfg)
+    def state_bits(self, d, context_len):
+        out = super().state_bits(d, context_len)
+        if self.m.family == "mean":       # correct the one mean atom per (chunk, head)
+            n_atoms = sum(len(chunk_plan(st.n, self.cfg, context_len)) for st in self.states.values()) \
+                * next(iter(self.states.values())).K.shape[0] * next(iter(self.states.values())).K.shape[1]
+            out["tok"] += n_atoms * (16.0 * atom_floats(self.m, d) - token_bits(d, self.cfg.KEEP_BITS))
+            out["total"] = out["exact"] + out["tok"] + out["mom"]
+        return out
+
+    def build(self, li, q, k, v, scaling, plan_T):
+        """
+        Finalise every chunk of this layer in ONE batched call (chunks are stacked on the batch
+        axis; finalize_chunk is batch-generic), then unfold the atoms in chunk order.  Each
+        chunk's result is the same as finalising it alone (the streaming decoder does that).
+        """
+        c = self.cfg
+        B, Hkv, n, d = k.shape
+        hide = torch.full((n,), BIG, dtype=torch.long)
+        if not plan_T:
+            return None, None, hide
+        nch, C = len(plan_T), c.CHUNK
+        kc = torch.cat([k[:, :, s:e + 1] for s, e, _ in plan_T]).float()          # (nch*B, H, C, d)
+        vc = torch.cat([v[:, :, s:e + 1] for s, e, _ in plan_T]).float()
+        qref = torch.cat([group_queries(q[:, :, tau - c.W_OBS + 1: tau + 1].float() * scaling, Hkv)
+                          for _, _, tau in plan_T])
+        res = finalize_chunk(kc, vc, qref, self.m, self.plan, c.KEEP_BITS, c,
+                             [(li, ci) for ci in range(nch)])
+        taus = torch.tensor([tau for _, _, tau in plan_T], dtype=torch.long)
+        for s_, e_, tau in plan_T:
+            hide[s_:e_ + 1] = tau
+
+        def unfold(x):                       # (nch*B, H, a, ...) -> (B, H, nch*a, ...)
+            y = x.reshape(nch, B, *x.shape[1:])
+            y = y.permute(1, 2, 0, *range(3, y.dim()))
+            return y.reshape(B, Hkv, nch * x.shape[2], *x.shape[3:])
+        tok = mom = None
+        if res["tok"] is not None:
+            t = res["tok"]
+            if self.record and t.get("idx") is not None:
+                for ci in range(nch):
+                    self.kept[(li, ci)] = t["idx"][ci * B:(ci + 1) * B].cpu()
+            if "use_atoms" in t:
+                self.atom_use.append(float(t["use_atoms"].float().mean()))
+            tok = {x: unfold(t[x]) for x in ("k", "v", "b")}
+            tok["tau"] = taus.repeat_interleave(t["k"].shape[2])
+        if res["mom"] is not None:
+            mm = res["mom"]
+            mom = {x: unfold(y) for x, y in mm.items() if isinstance(y, torch.Tensor)}
+            mom.update({f: mm[f] for f in ("order", "tilt", "project", "phase")})
+            mom["tau"] = taus.repeat_interleave(mm["mu_k"].shape[2])
+        return tok, mom, hide
+
+    def entries(self, li, q, k, v, scaling, pos):
+        plan_T = chunk_plan(k.shape[2], self.cfg, self.freeze_at)
         tok, mom, hide = self.build(li, q, k, v, scaling, plan_T)
-        return chunked_attention(q, scaling, pos, k, v, pos, hide, tok, mom, self.cfg.ATTN_CHUNK)
+        return k, v, hide, tok, mom
+
+
+class SnapKVMethod(LayerMethod):
+    """
+    SnapKV (Li et al., NeurIPS 2024): after prefilling the context, each KV head keeps the
+    tokens most attended by the last W_OBS context queries (scores summed over the window,
+    averaged over the query heads of the KV group, average-pooled with kernel SNAPKV_KERNEL)
+    plus the observation window itself.  One-shot at the horizon; queries before the horizon
+    use full attention (as in the original method), later tokens are kept exact.
+    """
+    family = "snapkv"
+    one_shot = True
+
+    def __init__(self, cfg, keep: int, name: str):
+        super().__init__(cfg)
+        self.keep, self.name = keep, name
+
+    def entries(self, li, q, k, v, scaling, pos):
+        c = self.cfg
+        T = k.shape[2]
+        H = self.horizon(T)
+        B, Hkv = k.shape[0], k.shape[1]
+        w = min(c.W_OBS, H)
+        if self.freeze_at is None or self.keep >= H:
+            return LayerMethod.entries(self, li, q, k, v, scaling, pos)
+        qo = q[:, :, H - w:H].float() * scaling                             # (B,Hq,w,d)
+        kk = rep_heads(k[:, :, :H].float(), q.shape[1] // Hkv)
+        sc = qo @ kk.transpose(-1, -2)                                     # (B,Hq,w,H)
+        causal = torch.arange(H, device=k.device)[None, :] <= torch.arange(H - w, H, device=k.device)[:, None]
+        att = sc.masked_fill(~causal, float("-inf")).softmax(-1).sum(2)    # (B,Hq,H)
+        att = att.view(B, Hkv, -1, H).mean(2)[..., :H - w]                  # prefix only
+        ks = c.SNAPKV_KERNEL
+        att = F.avg_pool1d(att.reshape(B * Hkv, 1, -1), ks, stride=1, padding=ks // 2,
+                           count_include_pad=False).view(B, Hkv, -1)[..., :H - w]
+        top = torch.topk(att, max(0, self.keep - w), dim=-1).indices
+        kept = torch.zeros((B, Hkv, T), dtype=torch.bool, device=k.device)
+        kept.scatter_(-1, top, True)
+        kept[..., H - w:] = True                                           # window + post-horizon
+        hide = torch.where(kept, torch.full((B, Hkv, T), BIG, dtype=torch.long, device=k.device),
+                           torch.full((B, Hkv, T), H, dtype=torch.long, device=k.device))
+        return k, v, hide, None, None
+
+
+class StreamingLLMMethod(LayerMethod):
+    """
+    StreamingLLM (Xiao et al., ICLR 2024): sinks + the most recent tokens.  With a horizon it
+    is one-shot (keep sinks + the last keep - N_SINK context tokens); without one it is the
+    streaming policy (every query reads sinks + its last keep - N_SINK tokens).
+    """
+    family = "streamingllm"
+
+    def __init__(self, cfg, keep: int, name: str):
+        super().__init__(cfg)
+        self.keep, self.name = keep, name
+
+    def entries(self, li, q, k, v, scaling, pos):
+        c = self.cfg
+        T = k.shape[2]
+        pc = pos.cpu()
+        recent = max(1, self.keep - c.N_SINK)
+        if self.freeze_at is None:
+            hide = torch.where(pc < c.N_SINK, torch.full_like(pc, BIG), pc + recent)
+        else:
+            H = self.horizon(T)
+            drop = (pc >= c.N_SINK) & (pc < H - recent)
+            hide = torch.where(drop, torch.full_like(pc, H), torch.full_like(pc, BIG))
+        return k, v, hide, None, None
 
 
 class Sim:
@@ -1694,9 +1992,894 @@ def smoke_setup(cfg: Config):
         yield ModelConfig(name, "random-init", fam, 4), (model, test_ids)
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# LONG-CONTEXT BENCHMARKS: LongBench, RULER, long-document perplexity (C4, PG-19)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Protocol (as in NVIDIA kvpress and most KV-compression papers): the CONTEXT is prefilled
+# and compressed; compression is then frozen; the question, the answer prefix and the
+# generated tokens are appended exact for every method.  QUERY_AWARE = True instead
+# compresses context + question (SnapKV's original, question-aware setting).  Memory is
+# matched PER SAMPLE: every compressed method stores at most KEEP x the fp16 cache of the
+# context (measured from the captured state, reported per sample).  TiltKV compacts while
+# prefilling (bounded peak memory); SnapKV materialises the full cache first.
+#
+# LongBench prompts: split of the OFFICIAL THUDM/LongBench prompts into context / question /
+# answer-prefix parts (identical to NVIDIA kvpress' Xnhyacinth/LongBench conversion; the
+# concatenation reproduces the official prompt exactly for 12/16 English tasks and by
+# construction for trec, triviaqa, samsum, lcc).  Generation lengths: official
+# dataset2maxlen.  Metrics: official LongBench metrics.py / eval.py, verbatim.  Chat
+# templates are applied to every task except the official exceptions (trec, triviaqa,
+# samsum, lsht, lcc, repobench-p).  Over-long contexts are truncated in the middle (official
+# rule) at the token level.
+
+LB_CONTEXT_PREFIX = {
+    'narrativeqa': 'You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\nNow, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\n',
+    'qasper': 'You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write "unanswerable". If the question is a yes/no question, answer "yes", "no", or "unanswerable". Do not provide any explanation.\n\nArticle: {context}\n\n Answer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write "unanswerable". If the question is a yes/no question, answer "yes", "no", or "unanswerable". Do not provide any explanation.\n\n',
+    'multifieldqa_en': 'Read the following text and answer briefly.\n\n{context}\n\nNow, answer the following question based on the above text, only give me the answer and do not output any other words.\n\n',
+    'hotpotqa': 'Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\n',
+    '2wikimqa': 'Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\n',
+    'musique': 'Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\n',
+    'gov_report': 'You are given a report by a government agency. Write a one-page summary of the report.\n\nReport:\n{context}\n\n',
+    'qmsum': 'You are given a meeting transcript and a query containing a question or instruction. Answer the query in one or more sentences.\n\nTranscript:\n{context}\n\nNow, answer the query based on the above meeting transcript in one or more sentences.\n\n',
+    'multi_news': 'You are given several news passages. Write a one-page summary of all news. \n\nNews:\n{context}\n\n',
+    'trec': 'Please determine the type of the question below. Here are some examples of questions.\n\n{context}\n',
+    'triviaqa': 'Answer the question based on the given passage. Only give me the answer and do not output any other words. The following are some examples.\n\n{context}\n\n',
+    'samsum': 'Summarize the dialogue into a few short sentences. The following are some examples.\n\n{context}\n\n',
+    'passage_count': 'There are some paragraphs below sourced from Wikipedia. Some of them may be duplicates. Please carefully read these paragraphs and determine how many unique paragraphs there are after removing duplicates. In other words, how many non-repeating paragraphs are there in total?\n\n{context}\n\n',
+    'passage_retrieval_en': 'Here are 30 paragraphs from Wikipedia, along with an abstract. Please determine which paragraph the abstract is from.\n\n{context}\n\nThe following is an abstract.\n\n',
+    'lcc': 'Please complete the code given below. \n{context}',
+    'repobench-p': 'Please complete the code given below. \n{context}',
+}
+LB_QUESTION_TEMPLATE = {
+    'narrativeqa': 'Question: {input}\n\n',
+    'qasper': 'Question: {input}\n\n',
+    'multifieldqa_en': 'Question: {input}\n',
+    'hotpotqa': 'Question: {input}\n',
+    '2wikimqa': 'Question: {input}\n',
+    'musique': 'Question: {input}\n',
+    'gov_report': 'Now, write a one-page summary of the report.\n\n',
+    'qmsum': 'Query: {input}\n',
+    'multi_news': 'Now, write a one-page summary of all the news.\n\n',
+    'trec': '{input}',
+    'triviaqa': '{input}',
+    'samsum': '{input}',
+    'passage_count': 'Please enter the final count of unique paragraphs after removing duplicates. The output format should only contain the number, such as 1, 2, 3, and so on.\n\n',
+    'passage_retrieval_en': '{input}\n\nPlease enter the number of the paragraph that the abstract is from. The answer format must be like "Paragraph 1", "Paragraph 2", etc.\n\n',
+    'lcc': '{input}',
+    'repobench-p': '{input}',
+}
+LB_ANSWER_PREFIX = {
+    'narrativeqa': 'Answer:',
+    'qasper': 'Answer:',
+    'multifieldqa_en': 'Answer:',
+    'hotpotqa': 'Answer:',
+    '2wikimqa': 'Answer:',
+    'musique': 'Answer:',
+    'gov_report': 'Summary:',
+    'qmsum': 'Answer:',
+    'multi_news': 'Summary:',
+    'trec': 'Type:',
+    'triviaqa': 'Answer:',
+    'samsum': 'Summary:',
+    'passage_count': 'The final answer is: ',
+    'passage_retrieval_en': 'The answer is: ',
+    'lcc': 'Next line of code:\n',
+    'repobench-p': 'Next line of code:\n',
+}
+LB_MAX_NEW_TOKENS = {
+    'narrativeqa': 128,
+    'qasper': 128,
+    'multifieldqa_en': 64,
+    'hotpotqa': 32,
+    '2wikimqa': 32,
+    'musique': 32,
+    'gov_report': 512,
+    'qmsum': 512,
+    'multi_news': 512,
+    'trec': 64,
+    'triviaqa': 32,
+    'samsum': 128,
+    'passage_count': 32,
+    'passage_retrieval_en': 32,
+    'lcc': 64,
+    'repobench-p': 64,
+}
+
+LB_FIRST_LINE_TASKS = ("trec", "triviaqa", "samsum", "lsht")
+LB_NO_CHAT_TASKS = ("trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p")
+LB_SUFFIX_STRIP = {"trec": "Type:", "triviaqa": "Answer:", "samsum": "Summary:"}
+
+
+# ── Official LongBench metrics (THUDM/LongBench/LongBench/metrics.py, English part) ─────
+def lb_normalize_answer(s):
+    """Lower text and remove punctuation, articles and extra whitespace."""
+    import re as _re
+    import string as _string
+
+    def remove_articles(text):
+        return _re.sub(r"\b(a|an|the)\b", " ", text)
+
+    def white_space_fix(text):
+        return " ".join(text.split())
+
+    def remove_punc(text):
+        exclude = set(_string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+
+    return white_space_fix(remove_articles(remove_punc(s.lower())))
+
+
+def lb_count_score(prediction, ground_truth, **kwargs):
+    import re as _re
+    numbers = _re.findall(r"\d+", prediction)
+    right_num = sum(1 for number in numbers if str(number) == str(ground_truth))
+    return float(0.0 if len(numbers) == 0 else right_num / len(numbers))
+
+
+def lb_retrieval_score(prediction, ground_truth, **kwargs):
+    import re as _re
+    ground_truth_id = _re.findall(r'Paragraph (\d+)', ground_truth)[0]
+    numbers = _re.findall(r"\d+", prediction)
+    right_num = sum(1 for number in numbers if str(number) == str(ground_truth_id))
+    return float(0.0 if len(numbers) == 0 else right_num / len(numbers))
+
+
+def _fuzz_ratio(a: str, b: str) -> float:
+    """fuzzywuzzy.fuzz.ratio (official); rapidfuzz is the same Indel ratio; difflib last."""
+    try:
+        from fuzzywuzzy import fuzz
+        return float(fuzz.ratio(a, b))
+    except ImportError:
+        pass
+    try:
+        from rapidfuzz import fuzz
+        return float(round(fuzz.ratio(a, b)))
+    except ImportError:
+        import difflib
+        return float(round(100 * difflib.SequenceMatcher(None, a, b).ratio()))
+
+
+def lb_code_sim_score(prediction, ground_truth, **kwargs):
+    all_lines = prediction.lstrip('\n').split('\n')
+    prediction = ""
+    for line in all_lines:
+        if ('`' not in line) and ('#' not in line) and ('//' not in line):
+            prediction = line
+            break
+    return _fuzz_ratio(prediction, ground_truth) / 100
+
+
+def lb_classification_score(prediction, ground_truth, **kwargs):
+    em_match_list = []
+    all_classes = kwargs["all_classes"]
+    for class_name in all_classes:
+        if class_name in prediction:
+            em_match_list.append(class_name)
+    for match_term in em_match_list:            # (official code removes while iterating; kept)
+        if match_term in ground_truth and match_term != ground_truth:
+            em_match_list.remove(match_term)
+    return (1.0 / len(em_match_list)) if ground_truth in em_match_list else 0.0
+
+
+def lb_rouge_score(prediction, ground_truth, **kwargs):
+    try:
+        from rouge import Rouge
+    except ImportError:
+        raise RuntimeError("summarisation tasks need the official `rouge` package (pip install rouge)")
+    try:
+        scores = Rouge().get_scores([prediction], [ground_truth], avg=True)
+    except Exception:
+        return 0.0
+    return scores["rouge-l"]["f"]
+
+
+def lb_f1_score(prediction, ground_truth, **kwargs):
+    from collections import Counter
+    common = Counter(prediction) & Counter(ground_truth)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction)
+    recall = 1.0 * num_same / len(ground_truth)
+    return (2 * precision * recall) / (precision + recall)
+
+
+def lb_qa_f1_score(prediction, ground_truth, **kwargs):
+    return lb_f1_score(lb_normalize_answer(prediction).split(), lb_normalize_answer(ground_truth).split())
+
+
+LB_METRIC = {
+    "narrativeqa": lb_qa_f1_score, "qasper": lb_qa_f1_score, "multifieldqa_en": lb_qa_f1_score,
+    "hotpotqa": lb_qa_f1_score, "2wikimqa": lb_qa_f1_score, "musique": lb_qa_f1_score,
+    "gov_report": lb_rouge_score, "qmsum": lb_rouge_score, "multi_news": lb_rouge_score,
+    "trec": lb_classification_score, "triviaqa": lb_qa_f1_score, "samsum": lb_rouge_score,
+    "passage_retrieval_en": lb_retrieval_score, "passage_count": lb_count_score,
+    "lcc": lb_code_sim_score, "repobench-p": lb_code_sim_score,
+}
+
+
+def longbench_sample_score(task: str, prediction: str, answers: Sequence[str], all_classes) -> float:
+    """Per-sample score as in the official scorer(); the task score is 100 x the mean."""
+    if task in LB_FIRST_LINE_TASKS:
+        prediction = prediction.lstrip('\n').split('\n')[0]
+    score = 0.0
+    for ground_truth in answers:
+        score = max(score, LB_METRIC[task](prediction, ground_truth, all_classes=all_classes))
+    return 100.0 * score
+
+
+def ruler_sample_score(task: str, prediction: str, refs: Sequence[str]) -> float:
+    """RULER string_match_part (qa_*) / string_match_all (others), per sample, x 100."""
+    import re as _re
+    pred = _re.sub(r"[\x00-\x1f]", "", prediction.strip()).strip().lower()
+    hits = [1.0 if r.lower() in pred else 0.0 for r in refs]
+    return 100.0 * (max(hits) if task.split("_")[0] == "qa" else sum(hits) / len(hits))
+
+
+def metric_tests():
+    """Hand-computed checks of the metric implementations (run at start-up)."""
+    checks = {
+        "qa_f1": (lb_qa_f1_score("The answer is Paris.", "paris"), 0.5),
+        "qa_f1_exact": (lb_qa_f1_score("an Eiffel tower", "Eiffel Tower"), 1.0),
+        "classification": (lb_classification_score("NUM", "NUM", all_classes=["NUM", "LOC"]), 1.0),
+        "classification_two": (lb_classification_score("LOC or NUM", "NUM", all_classes=["NUM", "LOC"]), 0.5),
+        "retrieval": (lb_retrieval_score("Paragraph 3", "Paragraph 3"), 1.0),
+        "count": (lb_count_score("There are 7 of 7", "7"), 1.0),
+        "code_sim": (lb_code_sim_score("\nx = foo(1)\nmore", "x = foo(1)"), 1.0),
+        "code_sim_skip_comment": (lb_code_sim_score("# c\nx = 1", "x = 1"), 1.0),
+        "ruler_all": (ruler_sample_score("niah_multikey_1", "a and b", ["a", "c"]), 50.0),
+        "ruler_part": (ruler_sample_score("qa_1", "Paris", ["paris", "rome"]), 100.0),
+        "first_line": (longbench_sample_score("trec", "\nNUM\nLOC", ["NUM"], ["NUM", "LOC"]), 100.0),
+    }
+    bad = {k: v for k, v in checks.items() if abs(v[0] - v[1]) > 1e-9}
+    if bad:
+        raise RuntimeError(f"metric self-tests failed: {bad}")
+    logger.info(f"metric tests passed ({len(checks)} checks)")
+
+
+# ── Datasets (Hugging Face) ──────────────────────────────────────────────────────────
+def _load_hf(*args, **kw):
+    from datasets import load_dataset
+    return load_dataset(*args, **kw)
+
+
+def load_longbench(task: str, cfg: "Config") -> List[Dict]:
+    """
+    One LongBench(-E) task as dicts with context / question / answer_prefix / answers /
+    all_classes / length.  Order: Xnhyacinth/LongBench (parquet; kvpress), then the official
+    THUDM / zai-org data.zip read directly (no loading script; works with datasets >= 4).
+    """
+    name = f"{task}_e" if cfg.LONGBENCH_E else task
+    rows, errors = None, []
+    for kw in ({"name": name}, {"data_dir": name}):
+        try:
+            ds = _load_hf(cfg.LONGBENCH_HF, split="test", **kw)
+            rows = [dict(r) for r in ds]
+            break
+        except Exception as e:
+            errors.append(f"{cfg.LONGBENCH_HF} {kw}: {e!r}"[:300])
+    if rows is None:
+        rows = _load_longbench_zip(name, task, cfg, errors)
+    out = []
+    for i, r in enumerate(rows):
+        ans = r.get("answers")
+        ans = list(ans) if ans is not None and not isinstance(ans, str) else [ans]
+        cls = r.get("all_classes")
+        cls = list(cls) if cls is not None and not isinstance(cls, str) else cls
+        out.append({"id": r.get("_id", str(i)), "context": r["context"], "question": r["question"],
+                    "answer_prefix": r.get("answer_prefix", LB_ANSWER_PREFIX[task]), "answers": ans,
+                    "all_classes": cls, "length": r.get("length"), "task": task})
+    return out
+
+
+def _load_longbench_zip(name, task, cfg, errors) -> List[Dict]:
+    import zipfile
+    from huggingface_hub import hf_hub_download
+    for repo in cfg.LONGBENCH_ZIP_REPOS:
+        try:
+            path = hf_hub_download(repo_id=repo, filename="data.zip", repo_type="dataset")
+            with zipfile.ZipFile(path) as z:
+                member = next(m for m in z.namelist() if m.endswith(f"/{name}.jsonl") or m == f"{name}.jsonl")
+                raw = [json.loads(line) for line in z.read(member).decode("utf-8").splitlines() if line.strip()]
+            break
+        except Exception as e:
+            errors.append(f"{repo} data.zip: {e!r}"[:300])
+    else:
+        raise RuntimeError("LongBench could not be loaded:\n  " + "\n  ".join(errors))
+    rows = []
+    for r in raw:
+        inp = r["input"]
+        if task in LB_SUFFIX_STRIP:
+            inp = inp.removesuffix(LB_SUFFIX_STRIP[task])
+        rows.append({**r, "context": LB_CONTEXT_PREFIX[task].format(context=r["context"]),
+                     "question": LB_QUESTION_TEMPLATE[task].format(input=inp),
+                     "answer_prefix": LB_ANSWER_PREFIX[task]})
+    return rows
+
+
+def load_ruler(length: int, cfg: "Config") -> List[Dict]:
+    """RULER (Hsieh et al., COLM 2024) as hosted by kvpress: simonjegou/ruler, data_dir = length."""
+    ds = _load_hf(cfg.RULER_HF, data_dir=str(length), split="test")
+    df = ds.to_pandas()
+    out = []
+    for task, g in df.groupby("task", sort=True):
+        if cfg.RULER_MAX_PER_TASK:
+            g = g.sample(n=min(len(g), cfg.RULER_MAX_PER_TASK), random_state=SEED)
+        for i, r in g.iterrows():
+            out.append({"id": f"{task}-{i}", "context": r["context"], "question": r["question"],
+                        "answer_prefix": r["answer_prefix"], "answers": list(r["answer"]),
+                        "max_new_tokens": int(r["max_new_tokens"]), "task": task, "length": length})
+    return out
+
+
+def load_long_ppl(name: str, runner: "Runner", cfg: "Config") -> List[List[int]]:
+    """Long-document LM sequences: C4 (allenai/c4 validation shard, documents concatenated)
+    and PG-19 (emozilla/pg19-test, one book per sequence, first LONG_PPL_LEN tokens)."""
+    tok, bos = runner.tokenizer, runner.bos
+    L = min(cfg.LONG_PPL_LEN, runner.max_pos) - len(bos)
+    seqs = []
+    if name == "c4":
+        ds = _load_hf("allenai/c4", data_files={"validation": cfg.C4_FILE}, split="validation", streaming=True)
+        sep = tok("\n\n", add_special_tokens=False).input_ids
+        buf = []
+        for r in ds:
+            buf += tok(r["text"], add_special_tokens=False).input_ids + sep
+            while len(buf) >= L and len(seqs) < cfg.LONG_PPL_N:
+                seqs.append(bos + buf[:L])
+                buf = buf[L:]
+            if len(seqs) >= cfg.LONG_PPL_N:
+                break
+    elif name == "pg19":
+        try:
+            ds = _load_hf(cfg.PG19_HF, split="test", streaming=True)
+        except Exception as e:
+            raise RuntimeError(f"PG-19 could not be loaded from {cfg.PG19_HF} ({e!r}); set Config.PG19_HF to a "
+                               f"parquet copy of the PG-19 test split with a 'text' column") from e
+        for r in ds:
+            ids = tok(r["text"], add_special_tokens=False).input_ids
+            if len(ids) >= L:
+                seqs.append(bos + ids[:L])
+            if len(seqs) >= cfg.LONG_PPL_N:
+                break
+    else:
+        raise ValueError(f"unknown long-PPL dataset {name!r}")
+    return seqs
+
+
+# ── Prompt assembly ─────────────────────────────────────────────────────────────────
+def encode_item(runner: "Runner", item: Dict, max_new: int, cfg: "Config", chat_ok: bool = True) -> Dict:
+    """
+    Token ids of context and question parts (kvpress style): with a chat template, the user
+    turn contains context + question and the generation prompt follows; the answer prefix is
+    appended after it.  Without a template the model BOS (if any) starts the context.
+    Over-long contexts are truncated in the middle; returns ids, context_len and flags.
+    """
+    tok = runner.tokenizer
+    ctx, q, ap = item["context"], item["question"], item["answer_prefix"]
+    use_chat = bool(chat_ok and cfg.USE_CHAT_TEMPLATE and getattr(tok, "chat_template", None))
+    if use_chat:
+        sep = "<<<TILTKV_SEPARATOR_7f3a>>>"
+        if sep in ctx:
+            sep = "#" * (len(ctx) + 10)                                     # kvpress' separator
+        text = tok.apply_chat_template([{"role": "user", "content": ctx + sep}], add_generation_prompt=True,
+                                       tokenize=False)
+        ctx_text, suffix = text.split(sep)
+        ctx_ids = tok.encode(ctx_text, add_special_tokens=False)
+        q_text = q + suffix + ap
+    else:
+        ctx_ids = runner.bos + tok.encode(ctx, add_special_tokens=False)
+        q_text = q + ap
+    q_ids = tok.encode(q_text, add_special_tokens=False)
+    budget = min(cfg.MAX_CONTEXT_TOKENS, runner.max_pos - len(q_ids) - max_new - 1)
+    truncated = len(ctx_ids) > budget
+    if truncated:
+        half = budget // 2
+        ctx_ids = ctx_ids[:half] + ctx_ids[len(ctx_ids) - (budget - half):]
+    ids = ctx_ids + q_ids
+    return {"ids": ids, "context_len": len(ids) if cfg.QUERY_AWARE else len(ctx_ids),
+            "chat": use_chat, "truncated": truncated}
+
+
+# ── Matched-memory methods per sample ───────────────────────────────────────────────
+@dataclass(frozen=True)
+class BenchSpec:
+    name: str
+    family: str                        # full | kivi | cla | snapkv | streamingllm | chunk
+    keep: Optional[float] = None       # memory budget: fraction of the fp16 context cache
+    kivi_bits: Optional[int] = None
+    chunk: Optional[ChunkMethod] = None
+
+
+def bench_specs(cfg: "Config", for_ppl: bool = False) -> List[BenchSpec]:
+    out = [BenchSpec("full", "full")] + [BenchSpec(f"kivi{b}", "kivi", kivi_bits=b) for b in cfg.KIVI_BITS]
+    for r in cfg.KEEP_FRACTIONS:
+        t = f"{r:g}"
+        if not for_ppl:
+            out.append(BenchSpec(f"snapkv@{t}", "snapkv", r))
+        out.append(BenchSpec(f"streamingllm@{t}", "streamingllm", r))
+        for fam in ("tilt", "evict", "mean", "am"):
+            out.append(BenchSpec(f"{fam}@{t}", "chunk", r, chunk=ChunkMethod(f"{fam}@{t}", fam, 1.0)))
+    r0 = f"{cfg.PRIMARY_KEEP:g}"
+    out += [BenchSpec(f"tilt_nophase@{r0}", "chunk", cfg.PRIMARY_KEEP,
+                      chunk=ChunkMethod(f"tilt_nophase@{r0}", "tilt", 1.0, phase=False)),
+            BenchSpec(f"moment1@{r0}", "chunk", cfg.PRIMARY_KEEP,
+                      chunk=ChunkMethod(f"moment1@{r0}", "tilt", 1.0, order=1))]
+    if cfg.BENCH_INCLUDE_CLA:
+        out.append(BenchSpec("cla", "cla"))
+    if cfg.BENCH_METHODS:                                  # e.g. ("full", "tilt@", "snapkv@")
+        out = [s_ for s_ in out if s_.name == "full" or any(s_.name.startswith(m) for m in cfg.BENCH_METHODS)]
+    return out
+
+
+def chunk_rate_for_budget(P: int, keep: float, method: ChunkMethod, d: int, cfg: "Config"):
+    """
+    Bits per element of the compacted chunks such that sinks + pending + window (exact) plus
+    the chunks fit keep x the fp16 cache of a P-token context.  Falls back to the cheapest
+    feasible chunk code if the budget is below it (flagged; the measured memory is reported).
+    """
+    n_ch = len(chunk_plan(P, cfg, P))
+    if n_ch == 0:
+        return None, "no chunk completes (context too short)"
+    exact = P - n_ch * cfg.CHUNK
+    r = 16.0 * (keep * P - exact) / (n_ch * cfg.CHUNK)
+    floor = max(1e-3, 16.0 * atom_floats(method, d) * (method.atoms if method.family in ("tilt", "mean") else 0)
+                / (cfg.CHUNK * 2 * d))
+    if method.family in ("evict", "am"):
+        floor = (token_bits(d, cfg.KEEP_BITS) + (16 if method.family == "am" else 0)) / (cfg.CHUNK * 2 * d)
+    if r < floor:
+        return floor, "over budget (cheapest code used)"
+    return r, ""
+
+
+def make_method(spec: BenchSpec, P: int, runner: "Runner", cfg: "Config"):
+    if spec.family == "full":
+        return LayerMethod(cfg), ""
+    if spec.family == "kivi":
+        return KIVIMethod(cfg, spec.kivi_bits), ""
+    if spec.family == "cla":
+        return CLAMethod(cfg, runner.L), ""
+    if spec.family == "snapkv":
+        keep = max(cfg.W_OBS + 1, int(round(spec.keep * P)))
+        return SnapKVMethod(cfg, keep, spec.name), ("" if keep < P else "budget >= context")
+    if spec.family == "streamingllm":
+        keep = max(cfg.N_SINK + 1, int(round(spec.keep * P)))
+        return StreamingLLMMethod(cfg, keep, spec.name), ("" if keep < P else "budget >= context")
+    r, note = chunk_rate_for_budget(P, spec.keep, spec.chunk, runner.d, cfg)
+    if r is None:
+        return LayerMethod(cfg), note
+    m = ChunkedMethod(cfg, replace(spec.chunk, target_bits=r), runner.d)
+    m.name, m.family = spec.name, spec.chunk.family
+    if not m.plan["feasible"]:
+        return LayerMethod(cfg), "infeasible chunk code"
+    return m, note
+
+
+# ── Generation with a compressed cache ──────────────────────────────────────────────
+class DecodeCtl:
+    """Single-token (or multi-token) steps against captured LayerStates."""
+
+    def __init__(self, states: Dict[int, LayerState], cfg: "Config"):
+        self.states, self.cfg = states, cfg
+
+    def begin(self, positions):
+        self.pos = positions
+
+    def attend(self, module, q, k, v, mask, kwargs):
+        st = self.states[module.layer_idx]
+        scaling = kwargs.get("scaling") or module.scaling
+        if st.shared is None:
+            st.append(k, v, self.pos)
+            src = st
+        else:
+            src = self.states[st.shared]          # CLA: the source layer already appended this step
+        return src.attend(q, scaling, self.pos, self.cfg.ATTN_CHUNK), None
+
+
+@torch.no_grad()
+def generate(runner: "Runner", method: LayerMethod, ids: List[int], context_len: int, max_new: int,
+             stop_ids: set, stop_fn=None) -> Tuple[List[int], Dict]:
+    """
+    Greedy decoding.  One single-pass forward over the prompt with compression frozen at
+    context_len (state captured), then token-by-token steps that read the compressed state.
+    """
+    t0 = time.time()
+    P = len(ids)
+    method.freeze_at, method.capture_extra = context_len, max_new + 1
+    logits = runner.forward(torch.tensor([ids], device=DEVICE), method, logits_to_keep=1).logits[0, -1]
+    method.capture_extra = None
+    states = method.states
+    mem = method.state_bits(runner.d, context_len)
+    full_bits = context_len * runner.L * runner.Hkv * 2 * runner.d * 16.0
+    ctl = DecodeCtl(states, runner.cfg)
+    out = []
+    nxt = int(logits.float().argmax())
+    for i in range(max_new):
+        out.append(nxt)
+        if nxt in stop_ids or i == max_new - 1 or (stop_fn is not None and stop_fn(out)):
+            break
+        pos = torch.tensor([P + i], device=DEVICE)
+        ctl.begin(pos)
+        with routed(ctl):
+            lg = runner.model(input_ids=torch.tensor([[nxt]], device=DEVICE), position_ids=pos[None],
+                              use_cache=False).logits[0, -1]
+        nxt = int(lg.float().argmax())
+    method.states = {}
+    free_memory()
+    return out, {"memory_fraction": mem["total"] / full_bits, "prompt_len": P, "context_len": context_len,
+                 "n_generated": len(out), "seconds": time.time() - t0}
+
+
+def stop_ids_for(runner: "Runner") -> set:
+    ids = set()
+    for src in (runner.tokenizer.eos_token_id, getattr(runner.model.generation_config, "eos_token_id", None)):
+        if src is None:
+            continue
+        ids |= set(src) if isinstance(src, (list, tuple)) else {int(src)}
+    return ids
+
+
+@torch.no_grad()
+def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[int], context_len: int,
+                           n_new: int, cfg: "Config") -> pd.DataFrame:
+    """
+    The fast path (frozen single pass + compressed-state decoding) must reproduce a single
+    pass over prompt + generated tokens with the same horizon (teacher forcing).  For the full
+    cache it must also match Hugging Face's own cached greedy generate().
+    """
+    rows = []
+    for spec in specs:
+        m, note = make_method(spec, context_len, runner, cfg)
+        gen, _ = generate(runner, m, ids, context_len, n_new, set())
+        ref_m, _ = make_method(spec, context_len, runner, cfg)
+        ref_m.freeze_at = context_len
+        x = torch.tensor([ids + gen[:-1]], device=DEVICE)
+        lg = runner.forward(x, ref_m, logits_to_keep=len(gen)).logits[0].float()
+        agree = float((lg.argmax(-1).cpu() == torch.tensor(gen)).float().mean())
+        rows.append({"method": spec.name, "argmax_agreement": agree, "n_tokens": len(gen), "note": note})
+    full = [r for r in rows if r["method"] == "full"]
+    if full:
+        hf = runner.model.generate(torch.tensor([ids], device=DEVICE), max_new_tokens=n_new, do_sample=False,
+                                   num_beams=1, eos_token_id=None, pad_token_id=0)[0, len(ids):].tolist()
+        m, _ = make_method(BenchSpec("full", "full"), context_len, runner, cfg)
+        gen, _ = generate(runner, m, ids, context_len, n_new, set())
+        full[0]["hf_generate_agreement"] = float(np.mean([a == b for a, b in zip(gen, hf)]))
+    df = pd.DataFrame(rows)
+    logger.info("  generation equivalence: " + ", ".join(
+        f"{r.method}={r.argmax_agreement:.3f}" for r in df.itertuples()) +
+        (f"; full vs HF generate {full[0]['hf_generate_agreement']:.3f}" if full else ""))
+    return df
+
+
+# ── Benchmark evaluation ────────────────────────────────────────────────────────────
+@torch.no_grad()
+def eval_long_ppl(runner: "Runner", method: LayerMethod, seqs: List[List[int]], cfg: "Config") -> pd.DataFrame:
+    """Streaming single pass per sequence (no freeze); NLL per position bin."""
+    rows = []
+    dec = runner.model.get_decoder()
+    head = runner.model.get_output_embeddings()
+    bins = list(cfg.LONG_PPL_BINS) + [BIG]
+    for si, ids in enumerate(seqs):
+        x = torch.tensor([ids], device=DEVICE)
+        pos = torch.arange(x.shape[1], device=DEVICE)
+        sim = Sim(method)
+        sim.begin(pos)
+        with routed(sim):
+            h = dec(input_ids=x, position_ids=pos[None], use_cache=False).last_hidden_state[0]
+        nll = torch.empty(x.shape[1] - 1)
+        for s in range(0, x.shape[1] - 1, 1024):
+            lg = head(h[s:min(s + 1024, x.shape[1] - 1)]).float()
+            nll[s:s + lg.shape[0]] = F.cross_entropy(lg, x[0, s + 1:s + 1 + lg.shape[0]], reduction="none").cpu()
+        tpos = torch.arange(1, x.shape[1])
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            sel = (tpos >= lo) & (tpos < hi)
+            if sel.any():
+                rows.append({"item": si, "bin": f"{lo}-{hi if hi < BIG else 'end'}",
+                             "nll": float(nll[sel].sum()), "n_tok": int(sel.sum())})
+        rows.append({"item": si, "bin": "all", "nll": float(nll.sum()), "n_tok": int(nll.numel())})
+    return pd.DataFrame(rows)
+
+
+def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequence[str], synthetic=None) -> pd.DataFrame:
+    """Runs the selected long-context suites; per-sample rows (score, measured memory, timing)."""
+    os.makedirs(out_dir, exist_ok=True)
+    specs = bench_specs(cfg)
+    stop = stop_ids_for(runner)
+    rows = []
+    rows_path = os.path.join(out_dir, "bench_samples.csv")
+    done = set()
+    if cfg.RESUME and os.path.exists(rows_path):
+        prev = pd.read_csv(rows_path)
+        rows = prev.to_dict("records")
+        done = {(r["benchmark"], r["task"], str(r["item"]), r["method"]) for r in rows}
+
+    def flush():
+        pd.DataFrame(rows).to_csv(rows_path, index=False)
+
+    def run_items(bench, task, items, scorer, max_new_of, chat_ok):
+        sub = items if not cfg.MAX_SAMPLES else [items[i] for i in sorted(
+            _rng("sub", bench, task).choice(len(items), min(len(items), cfg.MAX_SAMPLES), replace=False))]
+        pred_dir = os.path.join(out_dir, "pred", bench)
+        for it in sub:
+            max_new = max_new_of(it)
+            enc = encode_item(runner, it, max_new, cfg, chat_ok)
+            first_line = task in LB_FIRST_LINE_TASKS and bench.startswith("longbench")
+
+            def stop_fn(gen, _tok=runner.tokenizer):
+                return first_line and "\n" in _tok.decode(gen, skip_special_tokens=True).lstrip("\n")
+            for spec in specs:
+                key = (bench, task, str(it["id"]), spec.name)
+                if key in done:
+                    continue
+                method, note = make_method(spec, enc["context_len"], runner, cfg)
+                gen, info = generate(runner, method, enc["ids"], enc["context_len"], max_new, stop, stop_fn)
+                pred = runner.tokenizer.decode(gen, skip_special_tokens=True)
+                score = scorer(it, pred)
+                rows.append({"benchmark": bench, "task": task, "item": str(it["id"]), "method": spec.name,
+                             "family": spec.family if spec.family != "chunk" else spec.chunk.family,
+                             "keep_budget": spec.keep, "score": score, "note": note,
+                             "truncated": enc["truncated"], "chat": enc["chat"], **info})
+                os.makedirs(os.path.join(pred_dir, spec.name), exist_ok=True)
+                with open(os.path.join(pred_dir, spec.name, f"{task}.jsonl"), "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"pred": pred, "answers": it["answers"], "all_classes": it.get("all_classes"),
+                                        "length": it.get("length")}, ensure_ascii=False) + "\n")
+            flush()
+            logger.info(f"    {bench}/{task} item {it['id']}: P={len(enc['ids'])} " + ", ".join(
+                f"{r['method']}={r['score']:.0f}" for r in rows[-len(specs):] if r["item"] == str(it["id"])))
+
+    if "longbench" in suites:
+        bench = "longbench-e" if cfg.LONGBENCH_E else "longbench"
+        for task in cfg.LONGBENCH_TASKS:
+            items = synthetic["longbench"][task] if synthetic else load_longbench(task, cfg)
+            logger.info(f"  {bench}/{task}: {len(items)} items")
+            run_items(bench, task, items,
+                      lambda it, pred, _t=task: longbench_sample_score(_t, pred, it["answers"], it.get("all_classes")),
+                      lambda it, _t=task: LB_MAX_NEW_TOKENS[_t], chat_ok=task not in LB_NO_CHAT_TASKS)
+    if "ruler" in suites:
+        for length in cfg.RULER_LENGTHS:
+            if length > runner.max_pos:
+                logger.warning(f"  RULER {length} exceeds the model context ({runner.max_pos}); skipped")
+                continue
+            items = synthetic["ruler"] if synthetic else load_ruler(length, cfg)
+            for task in sorted({it["task"] for it in items}):
+                run_items(f"ruler-{length}", task, [it for it in items if it["task"] == task],
+                          lambda it, pred: ruler_sample_score(it["task"], pred, it["answers"]),
+                          lambda it: it["max_new_tokens"], chat_ok=True)
+    if "longppl" in suites:
+        for name in cfg.LONG_PPL_DATASETS:
+            seqs = synthetic["longppl"] if synthetic else load_long_ppl(name, runner, cfg)
+            if not seqs:
+                continue
+            L = len(seqs[0])
+            for spec in bench_specs(cfg, for_ppl=True):
+                if (f"longppl-{name}", "lm", "all", spec.name) in done:
+                    continue
+                method, note = make_method(spec, L, runner, cfg)
+                t0 = time.time()
+                df = eval_long_ppl(runner, method, seqs, cfg)
+                if spec.family == "streamingllm":                    # streaming policy: keep tokens
+                    mem = min(1.0, method.keep / L)
+                else:                                                 # measured from the end state
+                    method.capture_extra, method.freeze_at = 0, L
+                    runner.forward(torch.tensor([seqs[0]], device=DEVICE), method, logits_to_keep=1)
+                    mem = method.state_bits(runner.d, L)["total"] / (L * runner.L * runner.Hkv * 2 * runner.d * 16.0)
+                    method.states, method.capture_extra = {}, None
+                for r in df.itertuples():
+                    rows.append({"benchmark": f"longppl-{name}", "task": r.bin, "item": str(r.item),
+                                 "method": spec.name, "family": spec.family if spec.family != "chunk"
+                                 else spec.chunk.family, "keep_budget": spec.keep, "score": -r.nll / r.n_tok,
+                                 "nll": r.nll, "n_tok": r.n_tok, "note": note, "memory_fraction": mem,
+                                 "context_len": L, "seconds": time.time() - t0})
+                flush()
+                g = df[df.bin == "all"]
+                logger.info(f"    longppl-{name} {spec.name:<20} ppl={math.exp(g.nll.sum() / g.n_tok.sum()):.4f} "
+                            f"memory={mem:.3f} {note}")
+    flush()
+    return pd.DataFrame(rows)
+
+
+def bench_contrasts(cfg: "Config") -> List[Tuple[str, str, str]]:
+    out = []
+    for r in cfg.KEEP_FRACTIONS:
+        t = f"{r:g}"
+        out += [(f"tilt_vs_snapkv@{t}", f"tilt@{t}", f"snapkv@{t}"),
+                (f"tilt_vs_streamingllm@{t}", f"tilt@{t}", f"streamingllm@{t}"),
+                (f"tilt_vs_evict@{t}", f"tilt@{t}", f"evict@{t}"),
+                (f"tilt_vs_mean@{t}", f"tilt@{t}", f"mean@{t}"),
+                (f"tilt_vs_am@{t}", f"tilt@{t}", f"am@{t}")]
+    t0 = f"{cfg.PRIMARY_KEEP:g}"
+    out += [(f"freezing@{t0}", f"tilt@{t0}", f"tilt_nophase@{t0}"),
+            (f"variance@{t0}", f"tilt@{t0}", f"moment1@{t0}")]
+    out += [(f"tilt@{t0}_vs_kivi{b}", f"tilt@{t0}", f"kivi{b}") for b in cfg.KIVI_BITS]
+    return out
+
+
+def paired_score_test(a: pd.DataFrame, b: pd.DataFrame, n_boot: int, n_perm: int, seed: int) -> Dict:
+    """Higher is better.  Per-unit paired difference A - B; bootstrap CI; sign-flip p."""
+    m = a.merge(b, on="unit", suffixes=("_a", "_b"))
+    d = (m.score_a - m.score_b).to_numpy()
+    if len(d) == 0:
+        return {"estimate": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
+                "p_value": float("nan"), "n_units": 0}
+    rng = np.random.default_rng(seed)
+    boot = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(1)
+    null = (rng.choice([-1.0, 1.0], size=(n_perm, len(d))) * d).mean(1)
+    p = (1 + np.sum(np.abs(null) >= abs(d.mean()) - 1e-12)) / (n_perm + 1)
+    return {"estimate": float(d.mean()), "ci_low": float(np.percentile(boot, 2.5)),
+            "ci_high": float(np.percentile(boot, 97.5)), "p_value": float(p), "n_units": len(d)}
+
+
+def bench_analysis(df: pd.DataFrame, cfg: "Config", model: str, family: str, out_dir: str) -> pd.DataFrame:
+    """Task scores (official aggregation) and pre-specified paired contrasts per benchmark."""
+    if df.empty:
+        return df
+    agg = df.groupby(["benchmark", "task", "method"], as_index=False).agg(
+        score=("score", "mean"), n=("score", "size"), memory_fraction=("memory_fraction", "mean"),
+        over_budget=("note", lambda s: float((s.fillna("").astype(str).str.len() > 0).mean())))
+    agg.insert(0, "model", model)
+    agg.to_csv(os.path.join(out_dir, "bench_task_scores.csv"), index=False)
+    rows = []
+    for bench, g in df.groupby("benchmark"):
+        lm = bench.startswith("longppl")
+        g = g[g.task == "all"] if lm else g
+        g = g.assign(unit=g.task.astype(str) + "/" + g["item"].astype(str))
+        for name, A, B in bench_contrasts(cfg):
+            ga, gb = g[g.method == A], g[g.method == B]
+            if ga.empty or gb.empty:
+                continue
+            r = paired_score_test(ga[["unit", "score"]], gb[["unit", "score"]], cfg.N_BOOT, cfg.N_PERM, SEED)
+            rows.append({"model": model, "model_family": family, "benchmark": bench, "contrast": name, "A": A,
+                         "B": B, "memory_A": ga.memory_fraction.mean(), "memory_B": gb.memory_fraction.mean(),
+                         "score_A": ga.score.mean(), "score_B": gb.score.mean(), **r})
+    ct = pd.DataFrame(rows)
+    if len(ct):
+        ct["p_holm"] = np.nan
+        for bench, idx in ct.groupby("benchmark").groups.items():
+            ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value"])
+        ct["memory_ok"] = ct.memory_A <= ct.memory_B * (1 + cfg.BUDGET_TOL) + 1e-9
+        ct["supported"] = (ct.estimate > 0) & (ct.p_holm < cfg.ALPHA) & ct.memory_ok
+        ct.to_csv(os.path.join(out_dir, "bench_contrasts.csv"), index=False)
+    return ct
+
+
+def bench_cross_model(cfg: "Config"):
+    cts = [pd.read_csv(p) for p in Path(cfg.RESULTS_DIR).glob("*/bench/bench_contrasts.csv")]
+    if not cts:
+        return
+    ct = pd.concat(cts, ignore_index=True)
+    ct.to_csv(os.path.join(cfg.OUTPUT_DIR, "bench_all_contrasts.csv"), index=False)
+    scores = [pd.read_csv(p) for p in Path(cfg.RESULTS_DIR).glob("*/bench/bench_task_scores.csv")]
+    if scores:
+        pd.concat(scores, ignore_index=True).to_csv(os.path.join(cfg.OUTPUT_DIR, "bench_all_task_scores.csv"), index=False)
+    rows = []
+    for (bench, name), g in ct.groupby(["benchmark", "contrast"], sort=False):
+        n = len(g)
+        need = int(math.ceil(cfg.DECISION_MIN_MODEL_FRACTION * n))
+        pw = float(stats.wilcoxon(g.estimate, alternative="greater").pvalue) if n >= cfg.MIN_MODELS_WILCOXON \
+            else float("nan")
+        met = int(g.supported.sum())
+        verdict = ("insufficient models" if n < cfg.MIN_MODELS_WILCOXON else
+                   "supported" if (met >= need and pw < cfg.ALPHA) else "not supported")
+        rows.append({"benchmark": bench, "contrast": name, "models_evaluated": n, "models_meeting_rule": met,
+                     "models_required": need, "median_estimate": float(g.estimate.median()),
+                     "p_wilcoxon_models": pw, "verdict": verdict})
+    dr = pd.DataFrame(rows)
+    dr.to_csv(os.path.join(cfg.OUTPUT_DIR, "bench_decision_rules.csv"), index=False)
+    for r in dr.itertuples():
+        logger.info(f"BENCH DECISION {r.benchmark:<14} {r.contrast:<28} {r.verdict:<20} "
+                    f"{r.models_meeting_rule}/{r.models_evaluated} median={r.median_estimate:+.3f}")
+
+
+def run_bench_model(mc: "ModelConfig", cfg: "Config", suites: Sequence[str], prebuilt=None):
+    out_dir = os.path.join(cfg.RESULTS_DIR, mc.name, "bench")
+    if prebuilt is None:
+        runner = Runner(mc, cfg)
+        synthetic = None
+    else:
+        model, tokenizer, synthetic = prebuilt
+        runner = Runner(mc, cfg, model=model, tokenizer=tokenizer)
+    os.makedirs(out_dir, exist_ok=True)
+    probe = synthetic["longbench"][cfg.LONGBENCH_TASKS[0]][0] if synthetic else {
+        "context": " ".join(["The grass is green. The sky is blue."] * 120) + " The code is 4711.",
+        "question": " What is the code?", "answer_prefix": " Answer:", "answers": ["4711"]}
+    enc = encode_item(runner, probe, 8, cfg)
+    eq_specs = [s for s in bench_specs(cfg) if s.name in
+                ("full", "kivi2", f"snapkv@{cfg.PRIMARY_KEEP:g}", f"streamingllm@{cfg.PRIMARY_KEEP:g}",
+                 f"tilt@{cfg.PRIMARY_KEEP:g}", f"am@{cfg.PRIMARY_KEEP:g}", f"mean@{cfg.PRIMARY_KEEP:g}")]
+    generation_equivalence(runner, eq_specs, enc["ids"], enc["context_len"], 8, cfg).to_csv(
+        os.path.join(out_dir, "generation_equivalence.csv"), index=False)
+    if synthetic:                      # positive control: gold answers must score 100 end to end
+        for task, items in synthetic["longbench"].items():
+            for it in items:
+                sc = longbench_sample_score(task, it["answers"][0], it["answers"], it.get("all_classes"))
+                if abs(sc - 100.0) > 1e-9:
+                    raise RuntimeError(f"gold answer scored {sc} on {task}")
+        for it in synthetic["ruler"]:
+            if ruler_sample_score(it["task"], " ".join(it["answers"]), it["answers"]) != 100.0:
+                raise RuntimeError("gold answer did not score 100 on RULER")
+        logger.info("  positive control passed: gold answers score 100 on every synthetic task")
+    df = run_benchmarks(runner, cfg, out_dir, suites, synthetic)
+    bench_analysis(df, cfg, mc.name, mc.family, out_dir)
+    if prebuilt is None:
+        runner.release()
+
+
+def smoke_bench_setup(cfg: "Config"):
+    """Tiny character-level model + synthetic LongBench / RULER / long-PPL stand-ins (offline)."""
+    from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
+    from transformers import LlamaConfig, PreTrainedTokenizerFast
+    chars = list(" abcdefghijklmnopqrstuvwxyz0123456789:?.=,;\n#")
+    vocab = {"<s>": 0, "</s>": 1, "<pad>": 2, **{ch: i + 3 for i, ch in enumerate(chars)}}
+    tk = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<pad>"))
+    tk.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")
+    tk.decoder = decoders.Fuse()
+    tok = PreTrainedTokenizerFast(tokenizer_object=tk, bos_token="<s>", eos_token="</s>", pad_token="<pad>")
+    g = np.random.default_rng(SEED)
+    letters = "abcdefghijklmnopqrstuvwxyz"
+
+    def kv_doc(n_pairs):
+        keys = ["".join(g.choice(list(letters), 3)) for _ in range(n_pairs)]
+        vals = ["".join(g.choice(list("0123456789"), 2)) for _ in range(n_pairs)]
+        return keys, vals, " ".join(f"{k}={v};" for k, v in zip(keys, vals))
+
+    def text_sample(n_pairs):
+        keys, vals, doc = kv_doc(n_pairs)
+        j = int(g.integers(n_pairs))
+        return f"{doc} q:{keys[j]}? a:{vals[j]}\n"
+
+    conf = LlamaConfig(vocab_size=len(vocab), hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+                       num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=2048,
+                       bos_token_id=0, eos_token_id=1, pad_token_id=2, tie_word_embeddings=True)
+    torch.manual_seed(SEED)
+    model = AutoModelForCausalLM.from_config(conf, attn_implementation=TILT_ATTN)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    model.train()
+    for _ in range(300):
+        batch = [tok(text_sample(20)).input_ids[:256] for _ in range(16)]
+        L = min(len(b) for b in batch)
+        x = torch.tensor([b[:L] for b in batch])
+        loss = model(input_ids=x, labels=x).loss
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    model.eval()
+    logger.info(f"bench smoke: trained char-level model, final loss {loss.item():.3f}")
+
+    def lb_items(task, n):
+        out = []
+        for i in range(n):
+            keys, vals, doc = kv_doc(40)
+            j = int(g.integers(40))
+            if task == "trec":
+                out.append({"id": str(i), "context": doc, "question": f" q:{keys[j]}?", "answer_prefix": " a:",
+                            "answers": [vals[j]], "all_classes": sorted(set(vals)), "length": len(doc), "task": task})
+            else:
+                out.append({"id": str(i), "context": doc, "question": f" q:{keys[j]}?", "answer_prefix": " a:",
+                            "answers": [vals[j]], "all_classes": None, "length": len(doc), "task": task})
+        return out
+    synthetic = {"longbench": {t: lb_items(t, 3) for t in cfg.LONGBENCH_TASKS},
+                 "ruler": [{**it, "task": "niah_single_1", "max_new_tokens": 4, "id": f"r{i}"}
+                           for i, it in enumerate(lb_items("qasper", 3))],
+                 "longppl": [tok(text_sample(60)).input_ids[:600] for _ in range(3)]}
+    return model, tok, synthetic
+
+
 def main():
     ap = argparse.ArgumentParser(description="TiltKV: exponential-family compaction of the KV cache")
+    ap.add_argument("--suite", nargs="+", default=["core"], choices=["core", "longbench", "ruler", "longppl"],
+                    help="core = WikiText-2/LAMBADA/passkey + theory tests; longbench / ruler / longppl = "
+                         "long-context benchmarks with generation from the compressed cache")
     ap.add_argument("--models", nargs="*", default=None)
+    ap.add_argument("--tasks", nargs="*", default=None, help="LongBench tasks (default: Config.LONGBENCH_TASKS)")
+    ap.add_argument("--longbench-e", action="store_true")
+    ap.add_argument("--ruler-lengths", nargs="*", type=int, default=None)
+    ap.add_argument("--keep", nargs="*", type=float, default=None, help="memory budgets (fractions of fp16 cache)")
+    ap.add_argument("--max-samples", type=int, default=None, help="per task")
+    ap.add_argument("--methods", nargs="*", default=None,
+                    help="benchmark method name prefixes, e.g. tilt@ snapkv@ streamingllm@ (full always runs)")
+    ap.add_argument("--query-aware", action="store_true", help="compress the question with the context")
+    ap.add_argument("--long-ppl-len", type=int, default=None)
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--output", default=None)
     ap.add_argument("--no-resume", action="store_true")
@@ -1706,12 +2889,26 @@ def main():
     kw = {}
     if a.output:
         kw["OUTPUT_DIR"] = a.output
+    if a.tasks:
+        kw["LONGBENCH_TASKS"] = tuple(a.tasks)
+    if a.ruler_lengths:
+        kw["RULER_LENGTHS"] = tuple(a.ruler_lengths)
+    if a.keep:
+        kw["KEEP_FRACTIONS"] = tuple(a.keep)
+        kw["PRIMARY_KEEP"] = sorted(a.keep)[len(a.keep) // 2]
+    if a.long_ppl_len:
+        kw["LONG_PPL_LEN"] = a.long_ppl_len
+    kw.update(MAX_SAMPLES=a.max_samples, QUERY_AWARE=a.query_aware, LONGBENCH_E=a.longbench_e)
+    if a.methods:
+        kw["BENCH_METHODS"] = tuple(a.methods)
     if a.smoke:
         kw.update(OUTPUT_DIR=a.output or str(PROJECT_ROOT / "tilt_smoke"), SMOKE=True, CHUNK=32, WINDOW=8,
                   W_OBS=8, KIVI_GROUP=8, TARGET_BITS=(6.0, 3.0, 2.0), PRIMARY_BITS=3.0, PPL_WINDOW=192,
                   PPL_STRIDE=96, PPL_MAX_WINDOWS=24, DIAG_WINDOWS=4, N_BOOT=500, N_PERM=2000,
                   DECODE_TEST_LEN=128, RUN_LAMBADA=False, RUN_PASSKEY=False, MIN_MODELS_WILCOXON=2,
-                  RESUME=False, AM_ITERS=100)
+                  RESUME=False, AM_ITERS=100, KEEP_FRACTIONS=(0.5, 0.25), PRIMARY_KEEP=0.25,
+                  MAX_CONTEXT_TOKENS=1500, LONG_PPL_BINS=(0, 128, 256), RULER_LENGTHS=(1024,),
+                  LONG_PPL_DATASETS=("synthetic",))
     cfg = Config(**kw)
     if a.no_resume:
         cfg.RESUME = False
@@ -1721,24 +2918,43 @@ def main():
     fh.setFormatter(logging.Formatter(LOG_FORMAT))
     logging.getLogger().addHandler(fh)
     with open(os.path.join(cfg.OUTPUT_DIR, "config.json"), "w") as f:
-        json.dump({k: ([asdict(m) for m in v] if k == "MODELS" else v) for k, v in cfg.__dict__.items()},
-                  f, indent=2, default=str)
+        json.dump({k: ([asdict(m) for m in v] if k in ("MODELS", "BENCH_MODELS") else v)
+                   for k, v in cfg.__dict__.items()}, f, indent=2, default=str)
     with open(os.path.join(cfg.OUTPUT_DIR, "theory_tests.json"), "w") as f:
         json.dump(theory_tests(), f, indent=2)
+    metric_tests()
+    bench_suites = [x for x in a.suite if x != "core"]
     summaries = []
     if cfg.SMOKE:
-        for mc, prebuilt in smoke_setup(cfg):
-            summaries.append(run_model(mc, cfg, prebuilt))
+        if "core" in a.suite:
+            for mc, prebuilt in smoke_setup(cfg):
+                summaries.append(run_model(mc, cfg, prebuilt))
+        if bench_suites:
+            run_bench_model(ModelConfig("tiny-char-llama", "random-init", "Llama", 1), cfg, bench_suites,
+                            smoke_bench_setup(cfg))
     else:
-        for mc in cfg.MODELS:
-            if a.models and mc.name not in a.models:
-                continue
-            try:
-                summaries.append(run_model(mc, cfg))
-            except torch.cuda.OutOfMemoryError as e:
-                logger.error(f"{mc.name}: out of memory ({e}); skipped")
-                free_memory()
-    cross_model(cfg, [s for s in summaries if s is not None])
+        catalog = {m.name: m for m in cfg.MODELS + cfg.BENCH_MODELS}
+        if a.models:
+            missing = [m for m in a.models if m not in catalog]
+            if missing:
+                raise SystemExit(f"unknown model(s) {missing}; add them to Config.MODELS / BENCH_MODELS")
+        if "core" in a.suite:
+            for mc in ([catalog[m] for m in a.models] if a.models else cfg.MODELS):
+                try:
+                    summaries.append(run_model(mc, cfg))
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"{mc.name}: out of memory ({e}); skipped")
+                    free_memory()
+        if bench_suites:
+            for mc in ([catalog[m] for m in a.models] if a.models else cfg.BENCH_MODELS):
+                try:
+                    run_bench_model(mc, cfg, bench_suites)
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"{mc.name}: out of memory in benchmarks ({e}); skipped")
+                    free_memory()
+    cross_model(cfg, [s_ for s_ in summaries if s_ is not None])
+    if bench_suites:
+        bench_cross_model(cfg)
 
 
 if __name__ == "__main__":
