@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+hedge_results/
+hedge_smoke/
