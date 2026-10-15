@@ -1,5 +1,5 @@
 """
-HEDGE_KV.py — HedgeKV: minimax rate-distortion allocation of the KV cache against the
+HEDGE_KV.py — HedgeKV (v2): minimax rate-distortion allocation of the KV cache against the
 questions you have not seen yet.
 
 A training-free, calibration-free KV-cache compressor for the setting that matters in
@@ -42,12 +42,46 @@ every query distribution in that family.  (Literature search Oct 2026; re-run be
 submission — the field moves monthly.)
 
 ════════════════════════════════════════════════════════════════════════════════════════
+1b. FIRST REAL RESULTS (v1, run ff84bf7f6fd2) AND WHAT v2 CHANGES
+════════════════════════════════════════════════════════════════════════════════════════
+  Llama-3.2-1B-Instruct, Qwen2.5-1.5B-Instruct, SmolLM3-3B; LongBench qasper, hotpotqa, trec
+  (1078 paired items in total; partial runs).  hedge minus baseline, pooled, sign-flip p:
+      budget   vs kvpress TOVA / ExpAttn / SnapKV / PyramidKV   vs evict   vs hedge_window
+      1/4         +9.9 / +8.3 / +11.5 / +12.3                     +3.0       +0.7 (p=0.39)
+      1/8        +15.5 / +18.9 / +16.9 / +16.9                    +7.8       +7.4 (p<0.001)
+      1/16       +17.3 / +19.8 / +15.6 / +15.7                    +8.3       +7.5 (p<0.001)
+  (all p <= 0.0002 unless shown; PyramidKV raised on part of the items).  The minimax
+  allocation beats the same codec and solver with the window-only prior (RDKV-type) at 8x and
+  16x, which is the paper's hypothesis.  Defects found in the same runs, fixed in v2:
+  * Uncentred codes.  hedge_uniform@1/4 (3-4-bit keys) scored 1.2 on Qwen2.5 qasper and
+    hedge_nodrop@1/8 8.9: the error of a per-token code scales with ||k||, and Qwen2.5's
+    k_proj bias adds a large shared component.  v2 codes k - mu, v - mu (per-head fp16 means of
+    the coded region): hedge_tests measures the logit error relative to the logit spread
+    falling from 1.16 to 0.034 (3 bits) and 0.31 to 0.009 (4 bits) on such keys.
+  * Blind zone.  The window group ignored reads at distance < HEDGE_LOCAL, so the last
+    HEDGE_LOCAL coded tokens (end of the document, instructions) were priced by no group.  v2:
+    the window group, which stands for the question, prices every read.
+  * Unexplained: Llama x qasper at 1/4 lost 6.1 points to hedge@1/8 (p = 0.003, 51 items
+    collapsed to 0); no other model / task shows it.  hedge_v1 (the v1 method, run at
+    PRIMARY_KEEP) and the new per-sample diagnostics (hedge_kbits, hedge_vbits, hedge_klow,
+    hedge_recent_kept) are there to settle it on the next run.
+  * Two fixes that were tested and REJECTED: per-token log-mass calibration (fit on the
+    observed queries) lowers the in-sample error but raises the held-out error (0.075 ->
+    0.094 at 2 bits: the mass bias of a code is query-dependent, a winner's-curse effect); an
+    L1 ("fully coherent errors") objective was worse than the squared one on held-out queries.
+  * Engineering: kvpress 0.5.5 breaks on transformers >= 5.3 (its hook reads cache_position):
+    detected at start-up, presses reported missing instead of crashing.  One shared exact
+    context pass per sample for every one-shot method (SHARED_PREFILL; checked against each
+    method's single pass) cuts the harness work roughly in half or better.
+
+════════════════════════════════════════════════════════════════════════════════════════
 2. METHOD AND THEORY (Props 1, 2, 4 are checked numerically in hedge_tests)
 ════════════════════════════════════════════════════════════════════════════════════════
-  Codec (credited, not new).  Per token and per K / V: a seeded random rotation R (randomised
+  Codec (credited, not new).  Per token and per K / V: subtract the per-head mean of the coded
+  region (fp16, stored once per layer and head), a seeded random rotation R (randomised
   Hadamard; QuaRot, TurboQuant ICLR 2026), then the Lloyd-Max code of N(0,1) at b in {1,2,3,4}
-  bits x one fp16 RMS scale, or int8 absmax (b = 8), or fp16 (b = 16).  R is regenerated from
-  the seed, so it costs nothing to store.
+  bits x one fp16 RMS scale, or int8 absmax (b = 8), or fp16 (b = 16, the vector itself).  R
+  is regenerated from the seed, so it costs nothing to store.
   Distortion is measured where it matters: in the residual stream after the output
   projection, ||W_O,a (o - o_hat)||^2 for each query head a (M_a = W_O,a^T W_O,a, from the
   weights; errors of all KV heads of a layer then add in one space).
@@ -105,6 +139,7 @@ submission — the field moves monthly.)
   hedge_bayes    same, mean over groups (expected distortion)                    (ablation)
   hedge_uniform  same codec, one precision for all tokens, no importance         (TurboQuant-type)
   hedge_nodrop   minimax without the drop option                                 (VarRate-type floor)
+  hedge_v1       v1 of the method (no centring, blind window group)              (ablation of v2)
   evict          chunk-local int8 eviction (the strongest method of run 8ab180e5ad91;
                  "quantised pruning")
   am             Attention-Matching-lite (Zweiger et al., ICML 2026), chunk-local, int8
@@ -203,6 +238,17 @@ VALIDATION (be explicit in any write-up; nothing below is a real-LLM result)
   * Toy query-agnostic retrieval (4-layer character model trained 2500 steps on key=value
     documents, question asked after compression): the FULL cache answered 1/120, i.e. the toy
     model never learned retrieval; the comparison is uninformative and no claim is drawn.
+  * v2 (--smoke, same engine checks as above, all passing): centring cuts the logit error
+    relative to the logit spread on keys with a shared component from 1.16 to 0.034 (3 bits)
+    and 0.31 to 0.009 (4 bits); the shared-prefill path reproduces every one-shot method's
+    single pass token for token (shared_path_agreement 1.000 for full, SnapKV, StreamingLLM
+    and every HedgeKV variant); payload == analytic bytes for every variant.  On the toy model
+    (keys without a shared offset) HedgeKV's KL to the full model is unchanged (0.0741 v2 vs
+    0.0742 v1) and hedge_uniform's falls 0.246 -> 0.190; the fraction kept of the most recent
+    coded tokens rises 0.26 -> 0.32 (blind-zone fix).  Context passes per LongBench item for
+    the default method set: 26 (v1) -> 9 (1 shared + KIVI-2/4 and chunk-local evict / AM at
+    three budgets); on a 329-token toy prompt this saves nothing measurable, on 4k-16k contexts
+    the prefill dominates.  Not run: real models (no Hub access here).
 """
 import os
 
@@ -347,6 +393,7 @@ class Config:
     HEDGE_QUERIES: int = 16        # sampled query positions per group
     HEDGE_LOCAL: int = 64          # only reads at distance >= HEDGE_LOCAL count (long-range attention)
     HEDGE_ITERS: int = 50          # Hedge rounds of the minimax solver
+    SHARED_PREFILL: bool = True    # one exact context pass per sample for all one-shot methods
 
     # ── Baselines ─────────────────────────────────────────────────────
     KIVI_BITS: Tuple[int, ...] = (2, 4)
@@ -705,6 +752,7 @@ class LayerMethod:
     """
     name = "full"
     family = "global"
+    one_shot = True                 # compresses only at the horizon: can reuse a shared prefill
 
     def __init__(self, cfg: "Config"):
         self.cfg = cfg
@@ -760,6 +808,7 @@ class LayerMethod:
 
 class KIVIMethod(LayerMethod):
     family = "kivi"
+    one_shot = False                # quantises while prefilling (rows leave the window)
 
     def __init__(self, cfg, bits: int):
         super().__init__(cfg)
@@ -841,6 +890,7 @@ class CLAMethod(LayerMethod):
     """Training-free cross-layer sharing, exactly KV_LDT_v12_2's `full` (all positions)."""
     family = "cla"
     name = "cla"
+    one_shot = False
 
     def __init__(self, cfg, L: int):
         super().__init__(cfg)
@@ -871,6 +921,7 @@ class CLAMethod(LayerMethod):
 class ChunkedMethod(LayerMethod):
     """Chunk-local baselines (evict = quantised pruning, am = Attention-Matching-lite) at matched memory."""
     family = "chunked"
+    one_shot = False
 
     def __init__(self, cfg, method: ChunkMethod, d: int, keep_bits: Optional[int] = None):
         super().__init__(cfg)
@@ -936,7 +987,7 @@ class SnapKVMethod(LayerMethod):
         if self.freeze_at is None or self.keep >= H or H <= w:
             return LayerMethod.entries(self, li, q, k, v, scaling, pos)
         rep = q.shape[1] // Hkv
-        qo = q[:, :, H - w:H].float()
+        qo = q_at(q, torch.arange(H - w, H)).float()
         kk = rep_heads(k[:, :, :H].float(), rep)
         att = (qo @ kk.transpose(-1, -2)) * scaling                         # (B,Hq,w,H)
         att = att + torch.triu(torch.full_like(att, float("-inf")), diagonal=H - w + 1)
@@ -1070,6 +1121,14 @@ def hedge_quant(x: torch.Tensor, R: torch.Tensor, bits: int):
     return (cb[codes] * s) @ R, codes.to(torch.uint8), s
 
 
+def centered_code(X: torch.Tensor, mu: torch.Tensor, R: torch.Tensor, bits: int):
+    """hedge_quant of X - mu, read back as mu + code (16 bit: X itself, bit-exact)."""
+    if bits >= 16:
+        return X, None, None
+    xh, codes, s = hedge_quant(X - mu, R, bits)
+    return xh + mu, codes, s
+
+
 def hedge_code_bits(d: int, bits: int) -> int:
     """Stored bits of one coded vector: d codes + one fp16 scale (none at 16 bits)."""
     return d * bits + (16 if bits < 16 else 0)
@@ -1110,13 +1169,17 @@ def hedge_groups(H: int, cfg: "Config") -> List[np.ndarray]:
 
 @torch.no_grad()
 def hedge_distortions(q, k, v, scaling, H: int, rs: int, re: int, M: torch.Tensor,
-                      KH: List[torch.Tensor], VH: List[torch.Tensor], cfg: "Config") -> Dict:
+                      KH: List[torch.Tensor], VH: List[torch.Tensor], cfg: "Config",
+                      window_all_reads: bool = True) -> Dict:
     """
     Attention-output distortion tables for one layer, measured in the residual stream (the
     metric M_a = W_O,a^T W_O,a of each query head's slice of the output projection, so the
     errors of all KV heads of a layer add up in the same space).  For a query q at position
     m with exact probabilities p (full causal softmax) and output o, and a compressible token
-    j in [rs, re) with m - j >= HEDGE_LOCAL (long-range reads only):
+    j in [rs, re) with m - j >= HEDGE_LOCAL (long-range reads only; the window group, which
+    stands for the question, prices EVERY read when window_all_reads -- otherwise the last
+    HEDGE_LOCAL coded tokens, often the end of the document and the instructions, are read by
+    no group and are priced at zero: the "blind zone" of v1):
         drop               D = (p_j / (1 - p_j))^2 ||v_j - o||^2_M                  (Prop. 1)
         key code b         D = G_j(q.(k_hat_j - k_j))^2 ||v_j - o||^2_M            (Prop. 1)
         value code b       D = p_j^2 ||v_hat_j - v_j||^2_M                          (first order)
@@ -1147,12 +1210,13 @@ def hedge_distortions(q, k, v, scaling, H: int, rs: int, re: int, M: torch.Tenso
         if te <= rs:
             continue
         nt = te - rs
-        qg = (q[0, :, pos].float() * scaling).view(Hkv, rep * nq, d)                 # grouped queries
+        qg = (q_at(q, pos)[0].float() * scaling).view(Hkv, rep * nq, d)              # grouped queries
         S = (qg @ k[0, :, :mmax].float().transpose(-1, -2)).view(Hkv, rep, nq, mmax)
         S = S.masked_fill(torch.arange(mmax, device=dev) > pos[:, None], float("-inf"))
         p = (S - S.logsumexp(-1, keepdim=True)).exp()
         o = (p.view(Hkv, rep * nq, mmax) @ v[0, :, :mmax].float()).view(Hkv, rep, nq, d)
-        far = torch.arange(rs, te, device=dev) <= (pos[:, None] - cfg.HEDGE_LOCAL)  # long-range reads only
+        local = 1 if (window_all_reads and gi == G - 1) else cfg.HEDGE_LOCAL
+        far = torch.arange(rs, te, device=dev) <= (pos[:, None] - local)           # reads that count
         pR = p[..., rs:te] * far
         oM = torch.einsum("hrqd,hrde->hrqe", o, Mg)
         u2 = (vMv[:, :, None, :nt] - 2 * (oM.reshape(Hkv, rep * nq, d) @ VR[:, :nt].transpose(-1, -2))
@@ -1297,10 +1361,13 @@ class HedgeMethod(LayerMethod):
     """
     family = "hedge"
 
+    one_shot = True
+
     def __init__(self, cfg, keep: float, name: str, runner: "Runner", mode: str = "minimax",
-                 allow_drop: bool = True):
+                 allow_drop: bool = True, center: bool = True, window_all_reads: bool = True):
         super().__init__(cfg)
         self.keep, self.name, self.mode, self.allow_drop = keep, name, mode, allow_drop
+        self.center, self.window_all_reads = center, window_all_reads
         self.runner = runner
         self.bits = list(cfg.HEDGE_BITS)
         d = runner.d
@@ -1340,23 +1407,38 @@ class HedgeMethod(LayerMethod):
         Hkv, d, n = k.shape[1], k.shape[-1], re - rs
         R = rotation_matrix(d, f"layer{li}").to(k.device)
         KR, VR = k[0, :, rs:re].float(), v[0, :, rs:re].float()
-        codesK = [hedge_quant(KR, R, b) for b in self.bits]
-        codesV = [hedge_quant(VR, R, b) for b in self.bits]
+        # v2: code k - mu and v - mu (per-head means of the coded region, stored in fp16).  The
+        # error of a per-token code scales with the coded vector's norm; a large shared component
+        # (Qwen2.5's k_proj bias) otherwise swamps the part of k that orders the logits
+        muK = as_stored(KR.mean(1, keepdim=True)) if self.center else torch.zeros_like(KR[:, :1])
+        muV = as_stored(VR.mean(1, keepdim=True)) if self.center else torch.zeros_like(VR[:, :1])
+        codesK = [centered_code(KR, muK, R, b) for b in self.bits]
+        codesV = [centered_code(VR, muV, R, b) for b in self.bits]
+        mean_bits = 2 * Hkv * d * 16.0 if self.center else 0.0
         # budget: keep x the fp16 context cache of this layer, minus the exact rows (sinks + window)
-        budget = self.keep * H * Hkv * 2 * d * 16.0 - (rs + (H - re)) * Hkv * 2 * d * 16.0
+        # and the stored means
+        budget = self.keep * H * Hkv * 2 * d * 16.0 - (rs + (H - re)) * Hkv * 2 * d * 16.0 - mean_bits
         if self.mode == "uniform" or not hedge_groups(H, c):        # no query can read at long range
             a = uniform_allocate(self.cost, self.cost, self.overhead, budget, Hkv, n,
                                  list(range(len(self.bits))))
         else:
             tab = hedge_distortions(q, k, v, scaling, H, rs, re, self.metric(li, k.device),
-                                    [x[0] for x in codesK], [x[0] for x in codesV], c)
+                                    [x[0] for x in codesK], [x[0] for x in codesV], c, self.window_all_reads)
             def rel(codes, X):                                                    # (nb, Hkv, n)
                 return torch.stack([((x[0] - X) ** 2).sum(-1) / (X ** 2).sum(-1).clamp_min(1e-30) for x in codes])
             a = hedge_allocate(tab["DK"], tab["DV"], tab["DD"], self.cost, self.cost, self.overhead,
                                budget, self.mode, self.allow_drop, c.HEDGE_ITERS, rel(codesK, KR), rel(codesV, VR))
         kidx, vidx, drop = a["kidx"].to(k.device), a["vidx"].to(k.device), a["drop"].to(k.device)
+        bits_t = torch.tensor(self.bits, dtype=torch.float32, device=k.device)
+        keep_m = ~drop
+        kb, vb = bits_t[kidx][keep_m], bits_t[vidx][keep_m]
+        recent = keep_m[:, -min(n, 2 * c.HEDGE_LOCAL):]                          # the former blind zone
         self.diag.append({x: a[x] for x in ("worst_group", "mean_group", "window_group", "lower_bound")}
-                         | {"kept": float((~drop).float().mean()), "over_budget": float(a["bits"] > budget + 1e-6)})
+                         | {"kept": float(keep_m.float().mean()), "over_budget": float(a["bits"] > budget + 1e-6),
+                            "kbits": float(kb.mean()) if kb.numel() else float("nan"),
+                            "vbits": float(vb.mean()) if vb.numel() else float("nan"),
+                            "klow": float((kb <= 2).float().mean()) if kb.numel() else float("nan"),
+                            "recent_kept": float(recent.float().mean())})
         kh, vh = torch.zeros_like(KR), torch.zeros_like(VR)                       # chosen reconstructions
         for bi in range(len(self.bits)):
             kh[kidx == bi], vh[vidx == bi] = codesK[bi][0][kidx == bi], codesV[bi][0][vidx == bi]
@@ -1371,9 +1453,10 @@ class HedgeMethod(LayerMethod):
         hide = full_hide.clone()
         hide[rs:re] = H
         if self.capture_extra is not None:
-            self.cbits[li] = a["bits"]
+            self.cbits[li] = a["bits"] + mean_bits
             self.stored[li] = {"kidx": kidx.cpu(), "vidx": vidx.cpu(), "drop": drop.cpu(),
-                               "K": [(x[1], x[2]) for x in codesK], "V": [(x[1], x[2]) for x in codesV]}
+                               "K": [(x[1], x[2]) for x in codesK], "V": [(x[1], x[2]) for x in codesV],
+                               "means": [muK.cpu(), muV.cpu()] if self.center else []}
         return k, v, hide, tok
 
     def state_bits(self, d: int, context_len: int) -> Dict[str, float]:
@@ -1389,6 +1472,7 @@ class HedgeMethod(LayerMethod):
         st = self.stored[li]
         keep = ~st["drop"]
         total = tensor_bytes(pack_codes(st["kidx"][keep] * len(self.bits) + st["vidx"][keep], int(self.overhead)))
+        total += sum(tensor_bytes(m.half()) for m in st["means"])                 # fp16 per-head means
         for part, sel in (("K", st["kidx"]), ("V", st["vidx"])):
             for bi, b in enumerate(self.bits):
                 m = keep & (sel == bi)
@@ -1504,6 +1588,21 @@ def hedge_tests() -> Dict:
         out[f"codec_rel_mse_{b}bit"] = rel
         if b in MAX_1960_MSE and rel > 1.25 * MAX_1960_MSE[b]:
             raise RuntimeError(f"{b}-bit rotated code: relative MSE {rel:.4f} far above Lloyd-Max")
+    # v2 centring: keys with a large shared component (as Qwen2.5's k_proj bias produces).  The
+    # logit error relative to the logit spread that orders the keys must fall sharply.
+    mu = torch.randn(d, generator=g)
+    mu = mu / mu.norm() * 6 * math.sqrt(d)
+    Xs = torch.randn(2000, d, generator=g) + mu
+    qq = torch.randn(64, d, generator=g) / math.sqrt(d)
+    spread = float(((qq @ (Xs - Xs.mean(0)).T) ** 2).mean())
+    for b in (3, 4):
+        unc = float(((qq @ (hedge_quant(Xs, R, b)[0] - Xs).T) ** 2).mean()) / spread
+        cen = float(((qq @ (centered_code(Xs, as_stored(Xs.mean(0, keepdim=True)), R, b)[0] - Xs).T) ** 2).mean()) / spread
+        out[f"logit_err_{b}bit_uncentred"], out[f"logit_err_{b}bit_centred"] = unc, cen
+        if not cen < 0.2 * unc:
+            raise RuntimeError(f"centring should cut the {b}-bit logit error ({unc:.3f} -> {cen:.3f})")
+    if not bool((centered_code(Xs, as_stored(Xs.mean(0, keepdim=True)), R, 16)[0] == Xs).all()):
+        raise RuntimeError("16-bit centred code must be the vector itself")
     # Prop. 1: exact single-entry perturbation, including eviction (delta = -inf)
     z = torch.randn(64, generator=g, dtype=torch.float64) * 2
     V = torch.randn(64, 8, generator=g, dtype=torch.float64)
@@ -2154,6 +2253,11 @@ def kvpress_module():
         sys.modules["pipes"] = shim
     try:
         import kvpress
+        if Version(transformers.__version__) >= Version("5.3"):
+            logger.warning(f"kvpress 0.5.5 needs transformers < 5.3 (its forward hook reads the attention "
+                           f"kwarg cache_position, which transformers {transformers.__version__} no longer "
+                           f"passes): the official presses are unavailable in this environment")
+            return None
         return kvpress
     except Exception as e:
         logger.warning(f"kvpress unavailable ({e!r})")
@@ -2183,8 +2287,10 @@ MASKING_PRESSES = ("adakv_snapkv", "expected_attention")   # AdaKV masks keys: m
 ALWAYS_RUN = ("full", "native_full")                        # references of every contrast / path control
 
 
-HEDGE_VARIANTS = {"hedge": ("minimax", True), "hedge_window": ("window", True), "hedge_bayes": ("bayes", True),
-                  "hedge_uniform": ("uniform", True), "hedge_nodrop": ("minimax", False)}
+HEDGE_VARIANTS = {"hedge": {"mode": "minimax"}, "hedge_window": {"mode": "window"}, "hedge_bayes": {"mode": "bayes"},
+                  "hedge_uniform": {"mode": "uniform"}, "hedge_nodrop": {"mode": "minimax", "allow_drop": False},
+                  # the method of runs ff84bf7f6fd2: no centring, window group blind to the last HEDGE_LOCAL tokens
+                  "hedge_v1": {"mode": "minimax", "center": False, "window_all_reads": False}}
 
 
 def bench_specs(cfg: "Config", for_ppl: bool = False) -> List[BenchSpec]:
@@ -2200,7 +2306,8 @@ def bench_specs(cfg: "Config", for_ppl: bool = False) -> List[BenchSpec]:
         out += [BenchSpec(f"{fam}@{t}", "chunk", r, chunk=chunk_method(f"{fam}@{t}", fam, 1.0)) for fam in ("evict", "am")]
         out += [BenchSpec(f"{v_}@{t}", "hedge", r, variant=v_) for v_ in ("hedge", "hedge_window", "hedge_uniform")]
     r0 = f"{cfg.PRIMARY_KEEP:g}"
-    out += [BenchSpec(f"{v_}@{r0}", "hedge", cfg.PRIMARY_KEEP, variant=v_) for v_ in ("hedge_bayes", "hedge_nodrop")]
+    out += [BenchSpec(f"{v_}@{r0}", "hedge", cfg.PRIMARY_KEEP, variant=v_)
+            for v_ in ("hedge_bayes", "hedge_nodrop", "hedge_v1")]
     if cfg.BENCH_INCLUDE_CLA:
         out.append(BenchSpec("cla", "cla"))
     if cfg.BENCH_METHODS:                                  # e.g. ("hedge@", "snapkv@")
@@ -2242,9 +2349,8 @@ def make_method(spec: BenchSpec, P: int, runner: "Runner", cfg: "Config"):
         keep = max(cfg.N_SINK + 1, kvpress_n_kept(P, spec.keep))
         return StreamingLLMMethod(cfg, keep, spec.name), ("" if keep < P else "budget >= context")
     if spec.family == "hedge":
-        mode, drop = HEDGE_VARIANTS[spec.variant]
         note = "" if P > cfg.N_SINK + cfg.WINDOW else "context <= sinks + window"
-        return HedgeMethod(cfg, spec.keep, spec.name, runner, mode, drop), note
+        return HedgeMethod(cfg, spec.keep, spec.name, runner, **HEDGE_VARIANTS[spec.variant]), note
     r, note = chunk_rate_for_budget(P, spec.keep, spec.chunk, runner.d, cfg)
     if r is None:
         return LayerMethod(cfg), note
@@ -2396,20 +2502,30 @@ def run_flags() -> Dict:
 
 @torch.no_grad()
 def generate(runner: "Runner", method: LayerMethod, ids: List[int], context_len: int, max_new: int,
-             stop_ids: set, stop_fn=None, measure: bool = True) -> Tuple[List[int], Dict]:
+             stop_ids: set, stop_fn=None, measure: bool = True, prefill: Optional[Dict] = None) -> Tuple[List[int], Dict]:
     """
     Greedy decoding on the reference harness.  One single-pass forward over the prompt with
     compression frozen at context_len (state captured), then token-by-token steps that read
     the compressed state.  Bytes and FLOPs are implementation-independent; the wall-clock and
     allocator fields are prefixed harness_ because they time an fp32 reference without fused
-    kernels and must never be read as deployment speed (only path = native rows are).
+    kernels and must never be read as deployment speed (only path = native rows are).  With a
+    shared prefill of the context (one-shot methods), the method compresses it and runs only
+    the question tokens; harness_prefill_s is then compression + question time.
     """
     P = len(ids)
-    method.freeze_at, method.capture_extra = context_len, max_new + 1
+    shared = prefill is not None and method.one_shot
     _reset_peak()
     _sync()
     t0 = time.perf_counter()
-    logits = runner.forward(torch.tensor([ids], device=DEVICE), method, logits_to_keep=1).logits[0, -1]
+    if shared:
+        if prefill["H"] != context_len:
+            raise ValueError("the shared prefill must cover exactly the context")
+        compress_prefill(method, prefill, (P - context_len) + max_new + 1)
+        logits = run_tokens(runner, method.states, ids[context_len:], context_len) if P > context_len \
+            else prefill["last_logits"]
+    else:
+        method.freeze_at, method.capture_extra = context_len, max_new + 1
+        logits = runner.forward(torch.tensor([ids], device=DEVICE), method, logits_to_keep=1).logits[0, -1]
     nxt = int(logits.float().argmax())
     _sync()
     prefill_s = time.perf_counter() - t0
@@ -2422,7 +2538,8 @@ def generate(runner: "Runner", method: LayerMethod, ids: List[int], context_len:
             "full_cache_bytes": full_bits / 8.0, "prompt_len": P, "context_len": context_len,
             "harness_prefill_s": prefill_s, "harness_peak_prefill_bytes": peak_prefill,
             "path": "harness", "model_dtype": str(next(runner.model.parameters()).dtype),
-            "attention_dtype": "float32 (reference harness)", **run_flags()}
+            "attention_dtype": "float32 (reference harness)", "shared_prefill": shared,
+            "harness_shared_prefill_s": prefill["seconds"] if shared else float("nan"), **run_flags()}
     if measure:
         info["payload_bytes"] = payload_bytes(method, context_len)
         info["payload_vs_analytic"] = info["payload_bytes"] / info["analytic_bytes"] - 1 if mem["total"] else 0.0
@@ -2541,7 +2658,8 @@ def native_generate(runner: "Runner", ids: List[int], context_len: int, max_new:
     return out, info
 
 
-def run_spec(runner, spec: BenchSpec, enc: Dict, max_new: int, stop: set, stop_fn, cfg) -> Tuple[List[int], Dict, str]:
+def run_spec(runner, spec: BenchSpec, enc: Dict, max_new: int, stop: set, stop_fn, cfg,
+             pre: Optional[Dict] = None) -> Tuple[List[int], Dict, str]:
     """One (sample, method) generation on the right path."""
     if spec.family == "native":
         gen, info = native_generate(runner, enc["ids"], enc["context_len"], max_new, stop, stop_fn)
@@ -2556,7 +2674,8 @@ def run_spec(runner, spec: BenchSpec, enc: Dict, max_new: int, stop: set, stop_f
             return [], {"memory_fraction": float("nan"), "path": "native"}, f"kvpress error: {e!r}"[:200]
         return gen, info, ("masked keys: nominal memory" if spec.press in MASKING_PRESSES else "")
     method, note = make_method(spec, enc["context_len"], runner, cfg)
-    gen, info = generate(runner, method, enc["ids"], enc["context_len"], max_new, stop, stop_fn)
+    gen, info = generate(runner, method, enc["ids"], enc["context_len"], max_new, stop, stop_fn,
+                         prefill=pre if spec.family in SHARED_FAMILIES else None)
     return gen, info, note
 
 
@@ -2587,12 +2706,19 @@ def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[i
         m, note = make_method(spec, context_len, runner, cfg)
         gen, _ = generate(runner, m, ids, context_len, n_new, set())
         harness_gen[spec.name] = gen
+        shared_agree = float("nan")
+        if m.one_shot and spec.family in SHARED_FAMILIES:            # the shared-prefill path
+            m2, _ = make_method(spec, context_len, runner, cfg)
+            gen2, _ = generate(runner, m2, ids, context_len, n_new, set(),
+                               prefill=shared_prefill(runner, ids[:context_len]))
+            shared_agree = float(np.mean([a == b for a, b in zip(gen, gen2)])) if len(gen) == len(gen2) else 0.0
         ref_m, _ = make_method(spec, context_len, runner, cfg)
         ref_m.freeze_at = context_len
         x = torch.tensor([ids + gen[:-1]], device=DEVICE)
         lg = runner.forward(x, ref_m, logits_to_keep=len(gen)).logits[0].float()
         agree = float((lg.argmax(-1).cpu() == torch.tensor(gen)).float().mean())
-        rows.append({"method": spec.name, "argmax_agreement": agree, "n_tokens": len(gen), "note": note})
+        rows.append({"method": spec.name, "argmax_agreement": agree, "shared_path_agreement": shared_agree,
+                     "n_tokens": len(gen), "note": note})
     full = [r for r in rows if r["method"] == "full"]
     if full:
         hf = runner.model.generate(torch.tensor([ids], device=DEVICE), max_new_tokens=n_new, do_sample=False,
@@ -2603,8 +2729,13 @@ def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[i
     for spec in specs:
         if spec.family not in ("native", "kvpress"):
             continue
-        press = build_press(spec.press, spec.keep) if spec.family == "kvpress" else None
-        gen, _ = native_generate(runner, ids, context_len, n_new, set(), press=press)
+        try:
+            press = build_press(spec.press, spec.keep) if spec.family == "kvpress" else None
+            gen, _ = native_generate(runner, ids, context_len, n_new, set(), press=press)
+        except Exception as e:                       # recorded, never fatal (e.g. a press failing)
+            rows.append({"method": spec.name, "note": f"native path error: {e!r}"[:200]})
+            logger.warning(f"  generation equivalence: {spec.name} failed ({e!r})"[:300])
+            continue
         row = {"method": spec.name, "n_tokens": len(gen), "note": "native path"}
         # harness counterpart: full (fp32 harness vs model-dtype SDPA) and the SnapKV /
         # StreamingLLM replicas vs the official presses (same kept set => same tokens)
@@ -2613,7 +2744,10 @@ def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[i
         if twin in harness_gen:
             row["harness_agreement"] = float(np.mean([a == b for a, b in zip(gen, harness_gen[twin])]))
             row["harness_twin"] = twin
-        row.update(official_pipeline_agreement(runner, ids, context_len, n_new, spec))
+        try:
+            row.update(official_pipeline_agreement(runner, ids, context_len, n_new, spec))
+        except Exception as e:
+            row["note"] = f"official pipeline error: {e!r}"[:200]
         rows.append(row)
     df = pd.DataFrame(rows)
     logger.info("  generation equivalence: " + ", ".join(
@@ -2648,10 +2782,117 @@ def official_pipeline_agreement(runner: "Runner", ids, context_len, n_new, spec:
 
 
 
+# ── Shared prefill (one exact context pass per sample for every one-shot method) ──────
+#
+# A one-shot method (full cache, HedgeKV, SnapKV, StreamingLLM) compresses only at the horizon
+# H: every query before H reads the exact cache.  Its keys, values and queries over the context
+# are therefore the SAME for every such method, so the context is prefilled once per sample
+# (fp32 attention, exactly as each method's own single pass computes it), and each method only
+# compresses the captured cache and runs the question and the answer from its own state.
+# generation_equivalence() checks this path against each method's single pass
+# (shared_path_agreement).  Methods that compress while prefilling (KIVI, chunk-local evict /
+# AM, CLA) keep the single pass.
+
+SHARED_FAMILIES = ("full", "hedge", "snapkv", "streamingllm")
+
+
+class QRows:
+    """The query rows a context pass kept, addressed by absolute position (q_at)."""
+
+    def __init__(self, rows: torch.Tensor, positions: torch.Tensor, H: int):
+        self.rows = rows                                                  # (B, Hq, n, d)
+        self.shape = (rows.shape[0], rows.shape[1], H, rows.shape[3])
+        self.index = torch.full((H,), -1, dtype=torch.long, device=rows.device)
+        self.index[positions.to(rows.device)] = torch.arange(len(positions), device=rows.device)
+
+    def at(self, pos: torch.Tensor) -> torch.Tensor:
+        idx = self.index[pos.to(self.index.device)]
+        if bool((idx < 0).any()):
+            raise KeyError("query rows requested that the shared prefill did not keep")
+        return self.rows[:, :, idx]
+
+
+def q_at(q, pos: torch.Tensor) -> torch.Tensor:
+    """Rows of q (B, Hq, T, d) at absolute positions pos, for a tensor or a QRows."""
+    return q.at(pos) if isinstance(q, QRows) else q[:, :, pos.to(q.device)]
+
+
+def kept_query_positions(H: int, cfg: "Config") -> torch.Tensor:
+    """Every context position whose query a one-shot method reads: HedgeKV's groups and the
+    last max(SNAPKV_WINDOW, W_OBS) positions (SnapKV's observation window)."""
+    pos = set(range(max(0, H - max(cfg.SNAPKV_WINDOW, cfg.W_OBS)), H))
+    for g_ in hedge_groups(H, cfg):
+        pos.update(int(p) for p in g_)
+    return torch.tensor(sorted(pos), dtype=torch.long)
+
+
+class PrefillCapture:
+    """Exact fp32 attention over the context (LayerMethod's computation) that records every
+    layer's keys, values, scaling and the query rows at kept_query_positions."""
+
+    def __init__(self, keep_q: torch.Tensor, cfg: "Config"):
+        self.keep_q, self.cfg = keep_q, cfg
+        self.K, self.V, self.Q, self.scaling = {}, {}, {}, {}
+
+    def begin(self, positions):
+        self.pos = positions
+
+    def attend(self, module, q, k, v, mask, kwargs):
+        li, scaling = module.layer_idx, kwargs.get("scaling") or module.scaling
+        self.K[li], self.V[li], self.scaling[li] = k, v, scaling
+        self.Q[li] = q[:, :, self.keep_q.to(q.device)]
+        return chunked_attention(q, scaling, self.pos, k, v, self.pos, torch.full((k.shape[2],), BIG, dtype=torch.long),
+                                 None, self.cfg.ATTN_CHUNK), None
+
+
+@torch.no_grad()
+def shared_prefill(runner: "Runner", ctx_ids: List[int]) -> Dict:
+    H = len(ctx_ids)
+    keep = kept_query_positions(H, runner.cfg)
+    cap = PrefillCapture(keep, runner.cfg)
+    pos = torch.arange(H, device=DEVICE)
+    cap.begin(pos)
+    _sync()
+    t0 = time.perf_counter()
+    with routed(cap):
+        lg = runner.model(input_ids=torch.tensor([ctx_ids], device=DEVICE), position_ids=pos[None],
+                          use_cache=False, logits_to_keep=1).logits[0, -1]
+    _sync()
+    return {"H": H, "K": cap.K, "V": cap.V, "Q": cap.Q, "keep": keep, "scaling": cap.scaling,
+            "last_logits": lg, "seconds": time.perf_counter() - t0}
+
+
+@torch.no_grad()
+def compress_prefill(method: LayerMethod, pre: Dict, extra: int):
+    """Compress a shared prefill with a one-shot method; the captured states go to method.states."""
+    H = pre["H"]
+    method.begin()
+    method.freeze_at, method.capture_extra = H, extra
+    pos = torch.arange(H, device=DEVICE)
+    for li in sorted(pre["K"]):
+        q = QRows(pre["Q"][li], pre["keep"], H)
+        K, V, hide, tok = method.entries(li, q, pre["K"][li], pre["V"][li], pre["scaling"][li], pos)
+        method.capture(li, K, V, pos, hide, tok)
+    method.capture_extra = None
+
+
+@torch.no_grad()
+def run_tokens(runner: "Runner", states: Dict[int, LayerState], toks: List[int], start: int, hidden: bool = False):
+    """Feed toks at positions start.. through the compressed states (appended exact); returns the
+    last logits, or every hidden state."""
+    ctl = DecodeCtl(states, runner.cfg)
+    pos = torch.arange(start, start + len(toks), device=DEVICE)
+    ctl.begin(pos)
+    x = torch.tensor([toks], device=DEVICE)
+    with routed(ctl):
+        if hidden:
+            return runner.model.get_decoder()(input_ids=x, position_ids=pos[None], use_cache=False).last_hidden_state[0]
+        return runner.model(input_ids=x, position_ids=pos[None], use_cache=False, logits_to_keep=1).logits[0, -1]
+
 # ── Benchmark evaluation ────────────────────────────────────────────────────────────
 @torch.no_grad()
 def eval_prefix(runner: "Runner", method: LayerMethod, ids: List[int], cfg: "Config",
-                ref_logp: Optional[torch.Tensor] = None) -> Tuple[Dict, torch.Tensor]:
+                ref_logp: Optional[torch.Tensor] = None, pre: Optional[Dict] = None) -> Tuple[Dict, torch.Tensor]:
     """
     PREFIX protocol, identical for every harness method: the first H = L - LONG_PPL_EVAL
     tokens are the context, compressed once at the horizon H (as before a question); tokens
@@ -2659,18 +2900,25 @@ def eval_prefix(runner: "Runner", method: LayerMethod, ids: List[int], cfg: "Con
     plus the exact tokens since H.  Returns the NLL, the stored fraction of the prefix cache
     (from the captured state of the same forward) and, given the full cache's log-probs
     ref_logp, the mean KL(full || method) per scored token: FIDELITY to the uncompressed
-    model, which a model's own length-extrapolation quirks cannot flatter.
+    model, which a model's own length-extrapolation quirks cannot flatter.  With a shared
+    prefill pre of the first H tokens, a one-shot method compresses it and reads the scored
+    tokens from its state (same computation, one context pass for all methods).
     """
     L = len(ids)
     H = L - cfg.LONG_PPL_EVAL
     x = torch.tensor([ids], device=DEVICE)
     pos = torch.arange(L, device=DEVICE)
-    method.freeze_at, method.capture_extra = H, 0
-    sim = Sim(method)
-    sim.begin(pos)
-    with routed(sim):
-        h = runner.model.get_decoder()(input_ids=x, position_ids=pos[None], use_cache=False).last_hidden_state[0]
-    logp = runner.model.get_output_embeddings()(h[H:L - 1]).float().log_softmax(-1)
+    if pre is not None and method.one_shot:
+        compress_prefill(method, pre, cfg.LONG_PPL_EVAL)
+        h = run_tokens(runner, method.states, ids[H:L - 1], H, hidden=True)
+    else:
+        method.freeze_at, method.capture_extra = H, 0
+        sim = Sim(method)
+        sim.begin(pos)
+        with routed(sim):
+            h = runner.model.get_decoder()(input_ids=x, position_ids=pos[None], use_cache=False).last_hidden_state[0]
+        h = h[H:L - 1]
+    logp = runner.model.get_output_embeddings()(h).float().log_softmax(-1)
     nll = -logp.gather(-1, x[0, H + 1:L, None])[:, 0]
     mem = method.state_bits(runner.d, H)["total"] / (H * runner.L * runner.Hkv * 2 * runner.d * 16.0)
     method.states, method.capture_extra = {}, None
@@ -2712,11 +2960,14 @@ def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequen
 
             def stop_fn(gen, _tok=runner.tokenizer):
                 return first_line and "\n" in _tok.decode(gen, skip_special_tokens=True).lstrip("\n")
+            pre = None                       # one exact context pass shared by the one-shot methods
             for spec in specs:
                 key = (bench, task, str(it["id"]), spec.name)
                 if key in done:
                     continue
-                gen, info, note = run_spec(runner, spec, enc, max_new, stop, stop_fn, cfg)
+                if pre is None and cfg.SHARED_PREFILL and spec.family in SHARED_FAMILIES:
+                    pre = shared_prefill(runner, enc["ids"][:enc["context_len"]])
+                gen, info, note = run_spec(runner, spec, enc, max_new, stop, stop_fn, cfg, pre)
                 pred = runner.tokenizer.decode(gen, skip_special_tokens=True)
                 score = float("nan") if note.startswith("kvpress error") else scorer(it, pred)
                 rows.append({"benchmark": bench, "task": task, "item": str(it["id"]), "method": spec.name,
@@ -2729,6 +2980,8 @@ def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequen
                                         "all_classes": it.get("all_classes"), "length": it.get("length")},
                                        ensure_ascii=False) + "\n")
                 done.add(key)
+            pre = None
+            free_memory()
             flush()
             logger.info(f"    {bench}/{task} item {it['id']}: P={len(enc['ids'])} " + ", ".join(
                 f"{r['method']}={r['score']:.0f}" for r in rows[-len(specs):] if r["item"] == str(it["id"])))
@@ -2767,11 +3020,12 @@ def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequen
                 if not todo:
                     continue
                 full_spec = next(s_ for s_ in specs_ppl if s_.name == "full")
-                ref, ref_logp = eval_prefix(runner, make_method(full_spec, H, runner, cfg)[0], ids, cfg)
+                pre = shared_prefill(runner, ids[:H]) if cfg.SHARED_PREFILL else None
+                ref, ref_logp = eval_prefix(runner, make_method(full_spec, H, runner, cfg)[0], ids, cfg, pre=pre)
                 for spec in todo:
                     t0 = time.time()
                     method, note = make_method(spec, H, runner, cfg)
-                    r = ref if spec.name == "full" else eval_prefix(runner, method, ids, cfg, ref_logp)[0]
+                    r = ref if spec.name == "full" else eval_prefix(runner, method, ids, cfg, ref_logp, pre)[0]
                     base = {"task": "all", "item": str(si), "method": spec.name, "family": spec.label,
                             "keep_budget": spec.keep, "note": note, "memory_fraction": r["memory_fraction"],
                             "context_len": H, "path": "harness", "harness_seconds": time.time() - t0,
@@ -2781,7 +3035,8 @@ def run_benchmarks(runner: "Runner", cfg: "Config", out_dir: str, suites: Sequen
                     rows.append({**base, "benchmark": f"{bench}-kl", "score": -r.get("kl", 0.0),
                                  "kl": r.get("kl", 0.0)})
                     done.add((bench, "all", str(si), spec.name))
-                del ref_logp
+                del ref_logp, pre
+                free_memory()
                 flush()
             g = pd.DataFrame([r_ for r_ in rows if r_["benchmark"] in (bench, f"{bench}-kl")])
             for m_, gm in (g.groupby("method") if len(g) else []):
@@ -2823,7 +3078,7 @@ def bench_contrasts(cfg: "Config") -> List[Tuple[str, str, str]]:
         out += [(f"hedge_vs_kvpress:{pn}@{t}", f"hedge@{t}", f"kvpress:{pn}@{t}") for pn in cfg.KVPRESS_PRESSES]
         out.append((f"{HARNESS_CHECK}snapkv@{t}", f"snapkv@{t}", f"kvpress:snapkv@{t}"))
     t0 = f"{cfg.PRIMARY_KEEP:g}"
-    out += [(f"hedge_vs_{b_}@{t0}", f"hedge@{t0}", f"{b_}@{t0}") for b_ in ("hedge_bayes", "hedge_nodrop")]
+    out += [(f"hedge_vs_{b_}@{t0}", f"hedge@{t0}", f"{b_}@{t0}") for b_ in ("hedge_bayes", "hedge_nodrop", "hedge_v1")]
     out += [(f"hedge@{t0}_vs_kivi{b}", f"hedge@{t0}", f"kivi{b}") for b in cfg.KIVI_BITS]
     out.append((f"{HARNESS_CHECK}full", "full", "native_full"))
     return out
