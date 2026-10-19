@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+hedge_results/
+hedge_smoke/
+quasar_results/
+quasar_smoke/
