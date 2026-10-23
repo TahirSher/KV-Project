@@ -166,10 +166,15 @@ engine of QUASAR_KV.py / HEDGE_KV.py, unchanged except where stated in section 6
     strata_uniform replace its basis ablations.
   * A transient CUDA out-of-memory error (the shared GPU of the QUASAR run) no longer ends the
     model's run: the pair is retried once, then left for a resumed run.
+  * --report PATH ...: paired statistics (macro over tasks, bootstrap CI, sign-flip p, Holm) of every
+    pre-registered contrast over all items in bench_samples.csv files or run logs, plus the share of
+    items the full cache already fails.  Per-item log lines are single draws of a noisy metric (one
+    F1 per item; 30% of qasper items score 0 even with the full cache) and are not results.
 
 Usage
     python STRATA_KV.py --smoke                                   # self-tests + benchmark engine, CPU
     python STRATA_KV.py --microbench 4096 16384 65536 131072 --micro-shape 64 8 4    # kernel timings
+    python STRATA_KV.py --report run.log [bench_samples.csv ...] --output report_dir   # interim paired report
     python STRATA_KV.py --check-data --suite longbench longbench-v2 ruler longppl
     python STRATA_KV.py --suite longbench --models Llama-3.2-1B-Instruct \\
            --tasks qasper hotpotqa trec repobench-p
@@ -3969,6 +3974,89 @@ def smoke_bench_setup(cfg: "Config"):
     return model, tok, synthetic
 
 
+# ── Interim report from a running (or finished) benchmark: paired statistics, not single lines ──
+ITEM_LINE = re.compile(r" - INFO -\s+(\S+)/(\S+) item (\S+): P=\d+ (.*)$")
+
+
+def read_progress(paths: Sequence[str]) -> pd.DataFrame:
+    """(benchmark, task, item, method, score) rows from bench_samples.csv files and / or run logs
+    (the per-item log lines); the last record of every (benchmark, task, item, method) wins."""
+    parts = []
+    for p in paths:
+        if p.endswith(".csv"):
+            df = pd.read_csv(p, dtype={"benchmark": str, "task": str, "item": str, "method": str})
+            parts.append(df[["benchmark", "task", "item", "method", "score"]])
+            continue
+        recs = []
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = ITEM_LINE.search(line)
+                if not m:
+                    continue
+                bench, task, item, rest = m.groups()
+                for kv in rest.split(", "):
+                    name, _, val = kv.rpartition("=")
+                    try:
+                        recs.append((bench, task, item, name, float(val)))
+                    except ValueError:
+                        continue
+        parts.append(pd.DataFrame(recs, columns=["benchmark", "task", "item", "method", "score"]))
+    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return df.drop_duplicates(["benchmark", "task", "item", "method"], keep="last") if len(df) else df
+
+
+def progress_report(paths: Sequence[str], cfg: "Config", out_dir: str) -> pd.DataFrame:
+    """
+    What a partial run supports: per task, the mean score and number of items of every method, the
+    share of items the FULL cache already fails (score 0: those items cannot discriminate between
+    compressors), and every pre-registered contrast as a paired test over all items both methods
+    have (macro over tasks; bootstrap CI; sign-flip p; Holm per benchmark).  Individual log lines
+    are single draws of a noisy per-item metric (one F1 per item) and must never be read as results.
+    """
+    df = read_progress(paths)
+    if df.empty:
+        raise SystemExit(f"no per-item results found in {list(paths)}")
+    df = df[df.score.notna()]
+    table = df.pivot_table(index="method", columns=["benchmark", "task"], values="score", aggfunc="mean")
+    counts = df.groupby(["benchmark", "task"]).item.nunique()
+    full0 = df[df.method == "full"].groupby(["benchmark", "task"]).score.apply(lambda s_: float((s_ == 0).mean()))
+    rows = []
+    for bench, g in df.groupby("benchmark"):
+        g = g.assign(unit=g.task + "/" + g["item"])
+        S = g.pivot_table(index="unit", columns="method", values="score")
+        task_of = S.index.str.split("/").str[0].to_numpy()
+        for name, A, B in bench_contrasts(cfg):
+            if A not in S or B not in S:
+                continue
+            ok = S[A].notna() & S[B].notna()
+            if not ok.any():
+                continue
+            d = (S[A] - S[B])[ok].to_numpy()
+            r = paired_score_test(d, task_of[ok.to_numpy()], cfg.N_BOOT, cfg.N_PERM, SEED)
+            rows.append({"benchmark": bench, "contrast": name, "A": A, "B": B,
+                         "score_A": float(S[A][ok].mean()), "score_B": float(S[B][ok].mean()), **r})
+    ct = pd.DataFrame(rows)
+    if len(ct):
+        ct["p_holm"] = np.nan
+        hyp = ~ct.contrast.str.startswith(HARNESS_CHECK)
+        for _, idx in ct[hyp].groupby("benchmark").groups.items():
+            ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value"])
+    os.makedirs(out_dir, exist_ok=True)
+    table.round(2).to_csv(os.path.join(out_dir, "report_scores.csv"))
+    ct.to_csv(os.path.join(out_dir, "report_contrasts.csv"), index=False)
+    for key, n in counts.items():
+        logger.info(f"REPORT {key[0]}/{key[1]}: {n} items; full cache scores 0 on {full0.get(key, float('nan')):.0%}")
+    macro = table.T.groupby(level=0).mean().T                  # macro over the tasks of each benchmark
+    for bench in macro.columns:
+        col = macro[bench].dropna().sort_values(ascending=False)
+        logger.info(f"REPORT {bench} macro mean over tasks:\n" + "\n".join(f"    {m_:<34} {v_:6.2f}" for m_, v_ in col.items()))
+    for r in ct.itertuples():
+        logger.info(f"REPORT {r.benchmark} {r.contrast:<38} {r.estimate:+6.2f} [{r.ci_low:+.2f}, {r.ci_high:+.2f}] "
+                    f"p={r.p_value:.4f} holm={r.p_holm:.4f} n={r.n_units}")
+    logger.info(f"REPORT written to {out_dir}")
+    return ct
+
+
 def main():
     ap = argparse.ArgumentParser(description="STRATA: head-synchronous precision strata of the KV cache")
     ap.add_argument("--suite", nargs="+", default=["longbench"], choices=["longbench", "longbench-v2", "ruler", "longppl"],
@@ -3993,6 +4081,8 @@ def main():
                     help="only the decode-attention microbenchmark (contexts LEN ..., default Config.MICRO_LENGTHS) "
                          "for --micro-shape head_dim kv_heads query_heads_per_kv, then exit")
     ap.add_argument("--micro-shape", nargs=3, type=int, default=(128, 8, 4))
+    ap.add_argument("--report", nargs="+", default=None, metavar="PATH",
+                    help="interim paired report from bench_samples.csv files and / or run logs, then exit")
     ap.add_argument("--output", default=None)
     ap.add_argument("--no-resume", action="store_true")
     a = ap.parse_args()
@@ -4023,6 +4113,9 @@ def main():
     if a.microbench is not None and a.microbench:
         kw["MICRO_LENGTHS"] = tuple(a.microbench)
     cfg = Config(**kw)
+    if a.report:
+        progress_report(a.report, cfg, a.output or os.path.join(cfg.RESULTS_DIR, "report"))
+        return
     if a.check_data:
         problems = preflight_data(cfg, a.suite)
         raise SystemExit(("data check FAILED:\n  " + "\n  ".join(problems)) if problems else 0)
