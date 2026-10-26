@@ -1,39 +1,43 @@
 """
-COVE_KV.py — COVE: COVerage-priced Eviction of the KV cache for query-agnostic reuse, decoded by the
-model's own attention kernel.
+COVE_KV.py — COVE: COVerage-priced Eviction of the KV cache, and COVE-Q (the same selection with more
+tokens at lower precision, bytes-matched), both decoded by the model's own attention kernel.
 
 A training-free, calibration-free KV-cache compressor for the compress-the-context protocol (the
 context is compressed once, before the question is seen; NVIDIA kvpress' setting).  Every KV head
 keeps the same number of tokens (sinks, the recent window, and the tokens with the largest
 COVERAGE score: the expected contribution to an exact bound on the attention-output error of
 eviction, under the context's OWN queries sampled over its whole length).  The compressed cache is
-a dense tensor of the model's dtype: decoding is the model's fused SDPA over fewer tokens, so the
-speed-up is that of attention over n_keep instead of n tokens, with no custom kernel.  The
-evaluation engine (LongBench, LongBench-v2, RULER, long PPL, official kvpress baselines, paired
-tests, decision rules) is the engine of STRATA_KV / QUASAR_KV / HEDGE_KV.
+a dense tensor of the model's dtype (COVE) or dense KIVI codes dequantised one layer at a time
+(COVE-Q); decoding is the model's fused SDPA, with no custom attention kernel.  The evaluation
+engine (LongBench, LongBench-v2, RULER, long PPL, official kvpress baselines, paired tests,
+non-inferiority tests, decision rules) is the engine of STRATA_KV / QUASAR_KV / HEDGE_KV.
 
 ════════════════════════════════════════════════════════════════════════════════════════
-1. WHY THIS DESIGN (measured, Llama-3.2-1B-Instruct, A100-class MIG slice, bf16, CUDA graphs)
+1. WHY THIS DESIGN (measured: Llama-3.2-1B-Instruct, the user's GPU (MIG slice), bf16, CUDA graphs)
 ════════════════════════════════════════════════════════════════════════════════════════
-  Decode-step attention of one layer (8 KV heads, head_dim 64), microseconds:
+  Decode-step attention of one layer (8 KV heads, head_dim 64), microseconds (STRATA microbench):
       context      full SDPA   SDPA over 1/4 | 1/8 | 1/16 of the tokens   STRATA kernel 1/4 | 1/8 | 1/16
-      4 096          16.5         11.2 | 11.4 |  9.8                         130 | 121 | 112
-      16 384         33.2         15.7 | 16.4 | 12.0                         163 | 170 | 148
-      65 536         89.1         31.2 | 23.4 | 18.2                         264 | 344 | 261
-  * Attention over the kept tokens is 1.5-4.9x faster than the full cache at exactly the stored
-    bytes; every mixed-precision kernel we wrote (QUASAR, STRATA) was 3-15x SLOWER than the full
-    cache, and STRATA's time did not fall with its bytes (fixed costs dominated).  At equal bytes
-    no mixed-precision cache can be faster than eviction (it reads the same bytes and must also
-    decode them), and our kernels were far from that bound.  COVE therefore decodes with SDPA.
+      4 096          15.7         12.1 | 11.7 |  9.4                         130 | 122 | 112
+      16 384         33.2         15.7 | 13.2 | 11.2                         160 | 167 | 147
+      65 536         90.8         31.6 | 20.3 | 15.0                         260 | 342 | 259
+  * Attention over the kept tokens is 1.3-6.0x faster than the full cache at exactly the stored
+    bytes.  Every mixed-precision kernel we wrote (QUASAR, STRATA) was 3-8x SLOWER than the FULL
+    cache, and STRATA's time did not fall with its bytes (fixed costs dominated).  End to end
+    (4 qasper items, medians): STRATA's compression took 1.63 s after a 0.15 s prefill, its time to
+    first token was 1.45 s against 0.24 s for the full cache; the evicting kvpress presses decoded
+    at 40-60 tokens/s against 20 for the full cache.  Speed comes from reading fewer tokens through
+    the model's own kernel; COVE does that.
   * The ingredient that carried the accuracy of all three earlier methods was the pricing of
     tokens by the context's own queries over its whole length: +9.1 / +18.6 points (HedgeKV,
     SmolLM3-3B, 1/8 / 1/16) and +4.2 (QUASAR, Llama-3.2-1B, 1/8) over pricing by the end window
-    (p <= 0.001).  The chunk-local int8 eviction baseline (which also prices every region of the
-    document by its own queries) beat SnapKV by +9 to +11 points on Llama at 1/8 and 1/16.
-  * Low-bit codes hurt on small models: KIVI-2 lost 8 points to the full cache on Llama-3.2-1B
-    qasper; mixed precision gained 1-3 points over int8 eviction at best.
-  COVE keeps the pricing, prices eviction with the right error model (section 3), and spends the
-  bytes on exact tokens that the model's own kernel reads.
+    (p <= 0.001).
+  * Quantisation is a MEMORY tool, not a speed tool, on standard kernels: at equal bytes a coded
+    cache holds 3-5x more tokens, so attention reads 3-5x more rows and the codes must be
+    dequantised first.  COVE-Q is therefore the accuracy end of the trade-off (more context kept at
+    the same memory), not the speed end; its decode time is measured (microbench, tokens_per_s),
+    never assumed.  "More tokens at lower precision beats fewer exact tokens at equal memory" is
+    published for SnapKV selection (MTLP, Findings of EMNLP 2025; snapkv_q2/_q4 here); COVE-Q tests
+    it with coverage selection on the deployment path.
 
 ════════════════════════════════════════════════════════════════════════════════════════
 2. METHOD (one-shot, per layer, after the prefill of the context; all on the device)
@@ -42,14 +46,13 @@ tests, decision rules) is the engine of STRATA_KV / QUASAR_KV / HEDGE_KV.
       of the context, plus the last W_OBS positions (the window group).  Segment groups count only
       reads at distance >= COVE_LOCAL; the window group counts every read.  No question token is
       used.  On the deployment path the query rows are captured during the model's own cached
-      prefill (no extra forward pass, unlike KVzip's reconstruction).
+      prefill (no extra forward pass, unlike KVzip's / KVgrad's context reconstruction).
   (b) Score.  For a sampled query (head a) with exact probabilities p and output o, token j gets
       p_{a,j} ||v_j - o_a||_{M_a}, M_a = W_O,a^T W_O,a (the error is measured in the residual
       stream, where it acts), summed over the query heads of its KV head and averaged over the
       group's queries; each group is normalised by its total over the layer and the groups are
       averaged (every part of the context has the same say).  COVE_POOL > 1 smooths the scores by
-      a moving average (SnapKV smooths its window scores with 5; the coverage score already
-      averages many queries, and on the smoke model smoothing hurt: default 1, ablation cove_pool5).
+      a moving average (default 1; ablation cove_pool5).
   (c) Selection.  n_keep = int(P x keep) per KV head (kvpress' count, so memory matches the
       official presses token for token): N_SINK sinks + the last WINDOW context tokens + the
       n_keep - N_SINK - WINDOW highest-scoring tokens.  Same count per head, different tokens:
@@ -57,9 +60,18 @@ tests, decision rules) is the engine of STRATA_KV / QUASAR_KV / HEDGE_KV.
   (d) Decoding.  The model's own attention (SDPA) over the compressed cache, on the same path as
       the official kvpress presses (native_cove_generate replaces Hugging Face's DynamicCache
       layers in place); question tokens and generated tokens are appended exact.
+  (e) COVE-Q (cove_q2, cove_q4).  The same selection at the BYTES of the budget: sinks and window
+      exact, n_q = the largest whole number of KIVI groups with n_exact x 16 + n_q x (b + 32 /
+      KIVI_GROUP) <= budget x 16 bits per element (cove_q_plan; at 1/8: ~0.40 P tokens at 4 bits,
+      ~0.67 P at 2 bits, against 0.125 P for COVE).  The n_q tokens are stored as KIVI-b codes (keys
+      per channel over KIVI_GROUP tokens, values per token over KIVI_GROUP channels; zero point and
+      scale per group in the model dtype; codes bit-packed).  Each layer's codes are dequantised
+      into a transient tensor when that layer attends (CodedLayer; fused by torch.compile on CUDA,
+      Config.COMPILE_DEQUANT) and read by SDPA together with the exact rows.  8-bit is excluded:
+      8-bit codes dequantised in bf16 exceed half a quantisation step (bf16 has 8 significant bits).
 
 ════════════════════════════════════════════════════════════════════════════════════════
-3. THEORY (cove_tests checks every identity numerically at start-up)
+3. THEORY (cove_tests checks every identity / bound numerically at start-up)
 ════════════════════════════════════════════════════════════════════════════════════════
   Prop 1 (eviction error, exact).  For one query with probabilities p, output o = sum_j p_j v_j and
   an evicted set S of mass P_S < 1, the output over the kept keys is o' = (o - sum_S p_j v_j) / (1 -
@@ -67,58 +79,86 @@ tests, decision rules) is the engine of STRATA_KV / QUASAR_KV / HEDGE_KV.
         ||o' - o|| <= ( sum_{j in S} p_j ||v_j - o|| ) / (1 - P_S).
   The numerator is additive over tokens: for a fixed number kept, keeping the tokens with the
   largest p_j ||v_j - o|| minimises it exactly.  The bound is tight when the evicted tokens' errors
-  are coherent (their v_j - o align), which is how eviction errors behave (eviction removes mass,
-  it does not add zero-mean noise); the squared per-token price of HedgeKV / QUASAR / STRATA,
-  sum_S p_j^2 ||v_j - o||^2 / (1 - p_j)^2, is the independent-error model, right for quantisation
-  noise, optimistic for eviction (cove_l2 is that ablation).
+  are coherent (their v_j - o align), which is how eviction errors behave (eviction removes mass);
+  the squared single-token price (p_j / (1 - p_j))^2 ||v_j - o||^2 (CAOTE's single-token change,
+  squared; HedgeKV / QUASAR / STRATA's drop price) is the independent-error model (ablation cove_l2).
   Prop 2 (coverage).  With the expectation over the context's own queries in every segment, the
   score bounds the expected eviction error of a future query distributed like any mixture of the
   segments (linearity of the expectation in the mixture weights); the end-window score bounds it
-  only for queries like the end window.  The window group is kept, so the question-like queries
-  that the end window represents are covered too.
+  only for queries like the end window.  The window group is kept, so question-like queries are
+  covered too.
   Prop 3 (decode cost).  With the same number of tokens per head the cache is a dense tensor and
   decoding is attention over n_keep tokens: memory and attention FLOPs / bytes per step are exactly
   keep x those of the full cache (+ the appended question and answer), with the model's kernel.
+  Prop 4 (COVE-Q: eviction + coding).  Let o'' be the output over the kept set K with coded keys
+  (logit perturbations delta_j = scaling q . dk_j) and values (errors e_j).  Exactly,
+  o'' - o = (o' - o) + (o'' - o'), and to first order in delta
+        ||o'' - o||_M <= [sum_S p_j ||v_j - o||_M] / (1 - P_S)  +  max_K ||e_j||_M
+                         + max_K |delta_j - delta_bar| . sum_K p'_j ||v_j - o'||_M,
+  delta_bar = sum_K p'_j delta_j (the logit term is sum_K p'_j (delta_j - delta_bar)(v_j - o'), and
+  sum_K p''_j e_j is a convex combination).  The first term falls as more tokens are kept; the
+  others are set by the code width (|e|, |delta| <= half a step per element).  The bound says WHY
+  more tokens at lower precision can win at equal bytes (eviction error grows with the evicted
+  mass, coding error does not), not THAT it wins: that is hypothesis H3, tested.
 
-  Prior work (venues verified Oct 2026 unless marked): H2O (NeurIPS 2023, cumulative attention, a
-  causally biased whole-context score), StreamingLLM (ICLR 2024), SnapKV (NeurIPS 2024, end-window
-  attention + pooling), TOVA (EMNLP 2024), PyramidKV (COLM 2025), Ada-KV (NeurIPS 2025), Expected
-  Attention (arXiv 2510.00636, Gaussian future queries), KVzip (NeurIPS 2025 oral, query-agnostic by
-  reconstructing the context, 2-3x prefill cost), Compactor (arXiv 2507.08143, query-agnostic
-  leverage scores); value-aware scores (e.g. VATP) weight attention by value norms.  KVzip and
-  Compactor are run as official kvpress baselines.  Not found in the literature as stated (searched
-  Oct 2026; re-check before submission): pricing eviction by the exact bound of Prop. 1 in the
-  output-projection metric under the context's own queries sampled over its whole length with
-  per-segment normalisation.  The contribution is a scoring rule and its theory, NOT a new kernel
-  or architecture; it must win on accuracy at equal memory and speed against KVzip, Compactor,
-  Expected Attention and SnapKV to be a paper.
+  Prior work (searched Oct 2026; venues marked * were not verified against the proceedings).
+  Whole-context / query-agnostic scoring: H2O (NeurIPS 2023, cumulative attention), KVzip (NeurIPS
+  2025, max attention while the model re-reads the context; 2-3x prefill), KVgrad (ICML 2026,
+  KVzip replay attention x ||v W_O|| x gradient norm), Compactor (arXiv 2507.08143*), KeyDiff
+  (arXiv 2504.15364*), Expected Attention (arXiv 2510.00636*), LAQ (EMNLP 2025, pseudo-lookahead
+  queries), GVote (ICLR 2026*), EchoPress (arXiv 2610.00412*, KVzip-like scores from prefill
+  queries), LORE-KV (arXiv 2610.07643*, projected leave-one-out output-deletion cost averaged over
+  sampled continuations).  Value- / output-aware scores: VATP (EMNLP 2024, attention x ||v||_1),
+  CAOTE (ICLR 2026, exact single-token change alpha_j / (1 - alpha_j) ||v_j - o||), CriticalKV
+  (ICML 2026, attention x ||v W_O||_1 from an output-perturbation bound), LaProx (arXiv 2605.07234*),
+  AnDPro (NeurIPS 2025), LAVa (Findings EMNLP 2025).  More tokens at lower precision: MTLP (Findings
+  EMNLP 2025), KIVI (ICML 2024).  Every ELEMENT of COVE is therefore published or close to
+  published: the novelty is a COMBINATION (set-level identity + triangle bound as the justification
+  of an additive p_j ||v_j - o||_{W_O^T W_O} score; the context's own prefill queries sampled per
+  segment with per-segment normalisation, no extra forward pass; equal counts per head for a dense
+  SDPA cache; the coded arm on the same selection), which was not found as such.  It is a paper only
+  if it WINS: against KVzip, KVgrad, CriticalKV, Compactor, Expected Attention and SnapKV at equal
+  real memory, and against MTLP (snapkv_q*) for COVE-Q.  Read LORE-KV, CAOTE, CriticalKV, EchoPress
+  and KVgrad in full before writing any novelty claim.
 
 ════════════════════════════════════════════════════════════════════════════════════════
-4. METHODS COMPARED AT MATCHED MEMORY
+4. HYPOTHESES (pre-registered; bench_contrasts) AND METHODS AT MATCHED MEMORY
 ════════════════════════════════════════════════════════════════════════════════════════
+  H1 (selection)    cove > every baseline at the same budget (Holm per benchmark; >= 7/9 models +
+                    Wilcoxon across models).
+  H2 (no loss)      NON-INFERIORITY to the full cache on the same path: mean(A - native_full) >
+                    -NI_MARGIN (1 point; long PPL 0.01 nat/token), one-sided alpha = 0.025, Holm
+                    within the family, for cove, cove_q2, cove_q4 and the strongest baselines at
+                    every budget.  "Without losing results" is this test, nothing weaker.
+  H3 (precision)    cove_q{b} > cove at the same bytes (more tokens at lower precision).
+  H4 (selection, coded)  cove_q{b} > snapkv_q{b} (MTLP) and > kvpress:kvzip at the same bytes.
+  H5 (speed)        descriptive: decode tokens/s, TTFT, compression time, one-layer microbench.
+  Methods:
   cove            COVE (proposed), deployment path (HF SDPA, bf16), every budget
+  cove_q2/_q4     COVE-Q (proposed), deployment path, every budget, bytes-matched
   cove_window     end-window scores only (SnapKV-type prior)              (ablation, PRIMARY_KEEP)
-  cove_l2         squared independent-error price                         (ablation, PRIMARY_KEEP)
+  cove_l2         squared single-token price                              (ablation, PRIMARY_KEEP)
   cove_pool5      SnapKV-style smoothing of the scores (kernel 5)          (ablation, PRIMARY_KEEP)
-  cove_ref        COVE on the fp32 harness (path check of cove)            (PRIMARY_KEEP)
+  cove_ref, cove_q4_ref   COVE / COVE-Q on the fp32 harness (path checks)  (PRIMARY_KEEP)
   kvpress:*       OFFICIAL NVIDIA kvpress 0.5.5: SnapKV, PyramidKV, AdaKV-SnapKV, Expected
-                  Attention, TOVA, Knorm, StreamingLLM, KVzip, Compactor (same path as cove);
-                  AdaKV, Expected Attention (AdaKV-wrapped) and KVzip mask keys: their memory is
-                  NOMINAL (flagged), COVE's is real
-  snapkv_q2/_q4   SnapKV + KIVI-2 / KIVI-4 at matched bytes (eviction + quantisation hybrid)
+                  Attention, TOVA, Knorm, StreamingLLM, KVzip, Compactor, CriticalKV (SnapKV
+                  scorer, the registry's criti_snapkv), KeyDiff, KVgrad (same path as cove);
+                  AdaKV, Expected Attention (AdaKV-wrapped), KVzip and KVgrad mask keys: their
+                  memory is NOMINAL (flagged), COVE's is measured
+  snapkv_q2/_q4   SnapKV + KIVI-2 / KIVI-4 at matched bytes (MTLP)
   evict, am       chunk-local int8 eviction / Attention-Matching-lite
   snapkv, streamingllm, kivi2, kivi4   harness replicas / KIVI
-  Pre-registered contrasts: cove vs every baseline at every budget; vs its ablations and KIVI at
-  PRIMARY_KEEP; path checks cove vs cove_ref, full vs native_full, snapkv vs kvpress:snapkv.
+  Path checks: cove vs cove_ref, cove_q4 vs cove_q4_ref, full vs native_full, snapkv vs kvpress:snapkv.
 
 ════════════════════════════════════════════════════════════════════════════════════════
 5. SYSTEMS MEASUREMENTS
 ════════════════════════════════════════════════════════════════════════════════════════
-  cove rows (native): prefill_s (model's cached prefill), compress_s (coverage scores + selection,
-  all layers, GPU-synchronised), ttft_s, decode_s, tokens_per_s, peak_*_bytes, cache_bytes_measured
-  (the compressed cache tensors), memory_fraction (n_keep / P).  microbench.csv: one layer's
-  decode-step attention, full SDPA vs SDPA over the COVE cache at every budget (CUDA graphs on
-  GPU), and COVE's compression time for that layer.
+  cove / cove_q rows (native): prefill_s (model's cached prefill), compress_s (scores + selection
+  [+ coding], all layers, GPU-synchronised), ttft_s, decode_s, tokens_per_s, peak_*_bytes,
+  cache_bytes_measured (the stored tensors: rows, codes, scales), n_kept, n_coded, memory_fraction.
+  microbench.csv: one layer's decode-step attention, full SDPA vs SDPA over the COVE cache vs
+  dequantise + SDPA over the COVE-Q cache at every budget; us_per_step (CUDA-graph replay) and
+  us_per_step_eager (launch overheads included, as in Hugging Face decoding); compression time.
 
 Usage
     python COVE_KV.py --smoke                                     # self-tests + benchmark engine, CPU
@@ -126,34 +166,43 @@ Usage
     python COVE_KV.py --report run.log [bench_samples.csv ...] --output report_dir   # interim paired report
     python COVE_KV.py --suite longbench --models Llama-3.2-1B-Instruct --tasks qasper hotpotqa trec
     python COVE_KV.py --suite longbench --models Llama-3.2-1B-Instruct --tasks qasper \\
-           --methods cove kvpress:kvzip kvpress:compactor kvpress:snapkv kvpress:expected_attention snapkv_q
+           --methods cove kvpress:kvzip kvpress:criticalkv kvpress:snapkv kvpress:expected_attention snapkv_q
 Requires torch >= 2.5, transformers >= 4.56 (< 5.3 for kvpress 0.5.5; tested on 5.2.0), scipy, pandas,
 datasets, huggingface_hub, fuzzywuzzy or rapidfuzz, rouge, kvpress == 0.5.5.
 
 VALIDATION (be explicit in any write-up; nothing below is a real-LLM result)
   Run offline on CPU only (Python 3.13, torch 2.14.1, transformers 5.2.0, kvpress 0.5.5).  NOT run
-  here: real LLMs, real Hugging Face datasets, GPU timings of COVE itself (the GPU numbers of
-  section 1 are the user's STRATA microbenchmark: SDPA over 1/4-1/16 of the tokens, which is COVE's
-  decode path).  Every accuracy claim is a hypothesis for the pre-registered decision rules.
-  * cove_tests: Prop. 1 identity exact (8e-14 on 200 random sets) and the bound holds (largest
-    ||o' - o|| / bound = 0.87); selection returns n_keep sorted distinct positions per head with
-    sinks and window; a budget of the whole context keeps every token; a token read only by an early
-    segment ranks in the top 5% of the coverage score (37th percentile under the end-window score)
-    and is kept.
+  here: real LLMs, real Hugging Face datasets, GPU timings of COVE / COVE-Q themselves (the GPU
+  numbers of section 1 are the user's STRATA runs; SDPA over 1/4-1/16 of the tokens is COVE's
+  decode path), torch.compile of the dequantisation (CUDA only).  Every accuracy claim is a
+  hypothesis for the pre-registered decision rules.
+  * cove_tests: Prop. 1 identity exact (8e-14 on 200 random sets) and its bound holds (largest
+    ||o' - o|| / bound = 0.87); Prop. 4's first-order bound holds (largest ratio 0.73 on 100 random
+    cases); COVE-Q codes dequantise exactly as the KIVI baseline's (max |difference| 0) and their
+    payload equals the analytic size byte for byte; cove_q_plan is within budget and maximal (3
+    lengths x 5 budgets x 2 widths); CodedLayer returns [codes ; exact ; new]; selection returns
+    n_keep sorted distinct positions per head with sinks and window; a token read only by an early
+    segment ranks in the top 5% of the coverage score (37th percentile under the end-window score).
+  * torch.compile of kivi_unpack (CPU inductor, dynamic shapes): bit-identical to eager over 3
+    lengths x 2 widths x 2 axes, one compilation.  The CUDA path itself was not run here.
   * --smoke (tiny character-level Llama, synthetic stand-ins of every benchmark; official kvpress
     presses through the pipes shim): harness == SDPA (1.3e-5); evict keep-all and COVE keep-all ==
-    full cache (0 for COVE); decoding from the compressed state == single pass for every harness
-    method (1.000); COVE's deployment path (HF SDPA + compressed DynamicCache) == its harness twin
-    cove_ref (1.000); full == HF generate(); native path == kvpress' official pipeline (1.000).
-    kvpress:kvzip cannot run on the random-init smoke model (it loads a tokenizer by the model's
-    hub name, which that model has not); the failure is recorded per item, not fatal.
-  * Fidelity, prefix protocol (smoke model, budget 0.25, KL(full || method), lower is better):
-    cove 0.299 | cove_l2 0.459 | cove_pool5 0.472 | cove_window 0.490 | SnapKV 1.203 |
-    StreamingLLM 1.138 | SnapKV + KIVI-4 1.086 | chunk-local int8 eviction 0.189 (twice as many
-    tokens at int8) | KIVI-4 0.0017 at 0.52 memory.  Every ablation moves the way section 3 predicts;
-    a toy model: no accuracy claim is drawn from it.
-  * Microbenchmark on CPU (eager): SDPA over the COVE cache 1.4-1.9x faster than over the full cache
-    at 512-2048 tokens; compression 5-29 ms per layer on CPU (record compress_s on GPU).
+    full cache (0 for COVE); deployment path == harness twin for cove AND cove_q4 (argmax agreement
+    1.000 each); full == HF generate(); native path == kvpress' official pipeline (1.000); measured
+    memory == analytic for every COVE arm.  kvpress:kvzip and kvpress:kvgrad cannot run on the
+    random-init smoke model (they load a tokenizer by the model's hub name); recorded per item, not
+    fatal.  kvpress:criticalkv and kvpress:keydiff run.
+  * Fidelity, prefix protocol (smoke model, KL(full || method), lower is better), budget 0.25:
+    cove_q4 0.139 | chunk-local int8 eviction 0.189 | cove_q2 0.194 | cove 0.299 | cove_l2 0.459 |
+    cove_pool5 0.472 | cove_window 0.490 | SnapKV + KIVI-2 0.719 | SnapKV + KIVI-4 1.086 |
+    StreamingLLM 1.138 | SnapKV 1.203; budget 0.5: cove_q4 0.0012 | KIVI-4 0.0017 (0.52 memory) |
+    cove 0.087.  The ordering is the one H1, H3 and H4 predict, on a random-init toy model: no
+    accuracy claim is drawn from it.
+  * Microbenchmark on CPU (eager, smoke-model shape, 2048 tokens): SDPA over the COVE cache
+    1.3-1.8x faster than over the full cache; COVE-Q 9-12x SLOWER than the full cache (eager
+    dequantisation of uint8 codes on a CPU).  CPU timings say nothing about a GPU, but the warning
+    stands: COVE-Q's decode time must be measured on the GPU (microbench rows cove_q*, tokens_per_s)
+    before any speed is claimed for it.
 """
 
 import os
@@ -301,6 +350,12 @@ class Config:
     SHARED_PREFILL: bool = True    # one exact context pass per sample for all one-shot harness methods
     MICRO_LENGTHS: Tuple[int, ...] = (4096, 16384, 65536)   # decode-attention microbenchmark contexts
     MICRO_REPEATS: int = 50
+    COVE_Q_BITS: Tuple[int, ...] = (2, 4)   # COVE-Q code widths (KIVI-b at the bytes of the budget; 8 is
+                                           # excluded: 8-bit codes dequantised in bf16 exceed half a step)
+    NI_MARGIN: float = 1.0                 # non-inferiority margin vs the full cache, score points (0-100)
+    NI_MARGIN_PPL: float = 0.01            # ... long-PPL benchmarks: nats per token (score = -NLL / token, -KL)
+    NI_MIN_UNITS: int = 30                 # paired units below which no non-inferiority decision is made
+    COMPILE_DEQUANT: bool = True           # CUDA: fuse COVE-Q's dequantisation with torch.compile (eager fallback)
 
     # ── Baselines ─────────────────────────────────────────────────────
     KIVI_BITS: Tuple[int, ...] = (2, 4)
@@ -352,7 +407,8 @@ class Config:
     # official NVIDIA kvpress presses run as SOTA baselines on the native HF path; a real
     # benchmark run stops if kvpress cannot be imported (ALLOW_MISSING_KVPRESS overrides)
     KVPRESS_PRESSES: Tuple[str, ...] = ("snapkv", "pyramidkv", "adakv_snapkv", "expected_attention",
-                                        "tova", "knorm", "streaming_llm", "kvzip", "compactor")
+                                        "tova", "knorm", "streaming_llm", "kvzip", "compactor",
+                                        "criticalkv", "keydiff", "kvgrad")
     ALLOW_MISSING_KVPRESS: bool = False
     MEASURE_FLOPS: bool = True                           # FlopCounterMode over the first decode step
     QUERY_AWARE: bool = False                            # True: question is compressed with the context
@@ -382,6 +438,8 @@ class Config:
             raise ValueError("PRIMARY_KEEP must be one of KEEP_FRACTIONS")
         if self.COVE_POOL < 1 or self.COVE_POOL % 2 == 0:
             raise ValueError("COVE_POOL must be an odd positive integer")
+        if not set(self.COVE_Q_BITS) <= {2, 4}:
+            raise ValueError("COVE_Q_BITS must be drawn from {2, 4}")
         if self.LONG_PPL_EVAL >= self.LONG_PPL_LEN:
             raise ValueError("LONG_PPL_EVAL must be shorter than LONG_PPL_LEN")
         # Results live under a hash of every result-relevant setting: resuming can never mix
@@ -1141,22 +1199,103 @@ def cove_select(q, k, v, scaling, H: int, n_keep: int, M: torch.Tensor, cfg: "Co
     return torch.cat([exact.expand(Hkv, len(exact)), mid], 1).sort(-1).values
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# COVE-Q: MORE TOKENS AT LOWER PRECISION, STILL DECODED BY SDPA (bytes-matched)
+# ════════════════════════════════════════════════════════════════════════════
+
+def cove_q_plan(H: int, budget_tokens: int, bits: int, cfg: "Config") -> Tuple[int, int]:
+    """
+    Token counts of COVE-Q at the bytes of `budget_tokens` exact tokens: the sinks and the last
+    WINDOW context tokens stay exact (16-bit), and n_q evictable tokens are stored as KIVI-b codes
+    (kivi_effective_bits(b) bits per element, scales and zero points included), the largest n_q with
+        n_exact x 16 + n_q x b_eff  <=  budget_tokens x 16,
+    rounded down to whole key groups (KIVI_GROUP tokens).  Returns (n_keep = n_exact + n_q, n_q);
+    a budget below the sinks + window keeps budget_tokens exact tokens, as COVE does.
+    """
+    rs, re = min(cfg.N_SINK, H), max(min(cfg.N_SINK, H), H - cfg.WINDOW)
+    n_exact = rs + H - re
+    if budget_tokens <= n_exact:                 # below sinks + window: COVE's own fallback (no codes)
+        return min(budget_tokens, H), 0
+    n_q = int(math.floor((budget_tokens - n_exact) * 16.0 / cfg.kivi_effective_bits(bits)))
+    n_q = max(0, min(n_q, re - rs)) // cfg.KIVI_GROUP * cfg.KIVI_GROUP
+    return n_exact + n_q, n_q
+
+
+def kivi_pack(x: torch.Tensor, bits: int, group: int, along_tokens: bool, store_dtype) -> Dict[str, torch.Tensor]:
+    """
+    KIVI codes of x (B, Hkv, n, d) in the format the deployment path stores: keys per channel over
+    groups of `group` consecutive tokens (n a multiple of group), values per token over groups of
+    `group` channels; zero point "lo" and "scale" per group in store_dtype; b-bit codes packed
+    8 // b per byte along the channels.  The rounding is kivi_quant's (codes of the STORED scale and
+    zero point), so with store_dtype = fp16 kivi_unpack reproduces kivi_quant's xhat (checked in
+    cove_tests).  Every entry is a tensor that is stored: tensor_bytes(result) is the payload.
+    """
+    qmax = 2 ** bits - 1
+    B, Hkv, n, d = x.shape
+    y = x.float()
+    if along_tokens:
+        g, red = y.reshape(B, Hkv, n // group, group, d), 3
+    else:
+        w = group if d % group == 0 else d
+        g, red = y.reshape(B, Hkv, n, d // w, w), 4
+    lim = torch.finfo(store_dtype).max
+    lo = g.amin(red, keepdim=True).clamp(-lim, lim).to(store_dtype)
+    sc = ((g.amax(red, keepdim=True) - lo.float()) / qmax).clamp(max=lim).to(store_dtype).float().clamp_min(2.0 ** -24)
+    codes = ((g - lo.float()) / sc).round().clamp(0, qmax).to(torch.uint8).reshape(B, Hkv, n, d)
+    per = 8 // bits
+    if per > 1:
+        shifts = torch.arange(per, device=x.device, dtype=torch.uint8) * bits
+        codes = (codes.view(B, Hkv, n, d // per, per) << shifts).sum(-1, dtype=torch.uint8)
+    return {"codes": codes.contiguous(), "lo": lo, "scale": sc.to(store_dtype)}
+
+
+def kivi_unpack(p: Dict[str, torch.Tensor], bits: int, along_tokens: bool, out_dtype) -> torch.Tensor:
+    """Dequantised (B, Hkv, n, d) tensor of kivi_pack's codes, computed in out_dtype (on the
+    deployment path: the model dtype, one transient layer at a time)."""
+    c = p["codes"]
+    B, Hkv, n = c.shape[:3]
+    per = 8 // bits
+    if per > 1:
+        shifts = torch.arange(per, device=c.device, dtype=torch.uint8) * bits
+        c = ((c[..., None] >> shifts) & (2 ** bits - 1)).reshape(B, Hkv, n, -1)
+    d = c.shape[-1]
+    c = c.to(out_dtype)
+    lo, sc = p["lo"].to(out_dtype), p["scale"].to(out_dtype)
+    c = c.view(B, Hkv, sc.shape[2], n // sc.shape[2], d) if along_tokens else c.view(B, Hkv, n, sc.shape[3], d // sc.shape[3])
+    return torch.addcmul(lo, c, sc).view(B, Hkv, n, d)
+
+
 class CoveMethod(LayerMethod):
     """
     COVE on the reference harness (fp32 attention): one-shot at the horizon, every KV head keeps
     the positions cove_select returns.  It is the harness twin of the deployment path (cove_*
     specs run through native_cove_generate on the model's own SDPA kernel); generation
     equivalence compares the two.  Variants: window_only (end-window scores: the SnapKV-type
-    prior), score 'l2' (independent-error price), pool 5 (SnapKV-style smoothing).
+    prior), score 'l2' (independent-error price), pool 5 (SnapKV-style smoothing), bits b (COVE-Q:
+    the same selection with n_q tokens stored as KIVI-b codes at the bytes of the budget,
+    cove_q_plan; sinks and window exact).
     """
     family = "cove"
 
     def __init__(self, cfg, keep: float, name: str, runner: "Runner", window_only: bool = False,
-                 score: str = "l1", pool: Optional[int] = None):
+                 score: str = "l1", pool: Optional[int] = None, bits: Optional[int] = None):
         super().__init__(cfg)
         self.keep, self.name, self.runner = keep, name, runner
-        self.window_only, self.score, self.pool = window_only, score, pool
+        self.window_only, self.score, self.pool, self.bits = window_only, score, pool, bits
         self.metrics: Dict[int, torch.Tensor] = {}
+        self.stored: Dict[int, Dict] = {}
+
+    def begin(self):
+        super().begin()
+        self.stored = {}
+
+    def plan(self, H: int) -> Tuple[int, int]:
+        """(n_keep, n_q): positions every KV head keeps, of which n_q are coded (0 without bits)."""
+        n_keep = kvpress_n_kept(H, self.keep)
+        return (min(n_keep, H), 0) if self.bits is None else cove_q_plan(H, n_keep, self.bits, self.cfg)
+
+    def entry_bits(self, kind, d):
+        return 2 * d * (16.0 if kind == "exact" or self.bits is None else self.cfg.kivi_effective_bits(self.bits))
 
     def out_metric(self, li: int, dev) -> torch.Tensor:
         """M_a = W_O,a^T W_O,a (d x d) for every query head a of layer li (from the weights)."""
@@ -1168,16 +1307,31 @@ class CoveMethod(LayerMethod):
         return self.metrics[li]
 
     def select(self, li: int, q, k, v, scaling, H: int) -> torch.Tensor:
-        return cove_select(q, k, v, scaling, H, kvpress_n_kept(H, self.keep), self.out_metric(li, k.device),
+        return cove_select(q, k, v, scaling, H, self.plan(H)[0], self.out_metric(li, k.device),
                            self.cfg, self.window_only, self.score, self.pool)
 
     def entries(self, li, q, k, v, scaling, pos):
         T = k.shape[2]
         H = self.horizon(T)
         B, Hkv = k.shape[0], k.shape[1]
-        if self.freeze_at is None or kvpress_n_kept(H, self.keep) >= H or B != 1:
+        n_keep, n_q = self.plan(H)
+        if self.freeze_at is None or (n_keep >= H and not n_q) or B != 1:
             return LayerMethod.entries(self, li, q, k, v, scaling, pos)
         idx = self.select(li, q, k, v, scaling, H)
+        if n_q:                    # COVE-Q: sinks + window exact, the selected others read as KIVI-b codes
+            c, d = self.cfg, k.shape[-1]
+            rs, re = min(c.N_SINK, H), max(min(c.N_SINK, H), H - c.WINDOW)
+            g = idx[None, :, rs:rs + n_q, None].expand(1, Hkv, n_q, d)
+            pk = kivi_pack(k.float().gather(2, g), self.bits, c.KIVI_GROUP, True, torch.float16)
+            pv = kivi_pack(v.float().gather(2, g), self.bits, c.KIVI_GROUP, False, torch.float16)
+            if self.capture_extra is not None:
+                self.stored[li] = {"k": pk, "v": pv}
+            hide = torch.full((B, Hkv, T), BIG, dtype=torch.long, device=k.device)
+            hide[:, :, rs:re] = H
+            tok = {"k": kivi_unpack(pk, self.bits, True, torch.float32),
+                   "v": kivi_unpack(pv, self.bits, False, torch.float32),
+                   "b": torch.zeros((B, Hkv, n_q), device=k.device), "tau": torch.full((n_q,), H, dtype=torch.long)}
+            return k, v, hide, tok
         kept = torch.zeros((B, Hkv, T), dtype=torch.bool, device=k.device)
         kept[0].scatter_(-1, idx, True)
         kept[..., H:] = True                                               # post-horizon tokens
@@ -1204,6 +1358,93 @@ class CacheCapture:
         return _SDPA(module, q, k, v, mask, **kwargs)
 
 
+try:
+    from transformers.cache_utils import DynamicLayer as _DynamicLayer
+except ImportError:                                  # transformers < 4.56: COVE-Q's native path is unavailable
+    _DynamicLayer = object
+
+
+class Unpacker:
+    """
+    kivi_unpack for the deployment path.  Eager, it runs ~5 elementwise kernels per tensor with
+    uint8 / bf16 intermediates; with Config.COMPILE_DEQUANT on CUDA it is compiled by torch.compile
+    (dynamic shapes) into fused kernels that read the codes once and write the dequantised rows once.
+    A compilation or run-time failure of the compiled function falls back to eager for the rest of
+    the run (logged once): the result is the same function either way.
+    """
+    fn = None
+
+    @classmethod
+    def get(cls, cfg: "Config"):
+        if not (cfg.COMPILE_DEQUANT and DEVICE.type == "cuda"):
+            return kivi_unpack
+        if cls.fn is None:
+            try:
+                cls.fn = torch.compile(kivi_unpack, dynamic=True)
+            except Exception as e:                       # noqa: BLE001 (eager is the same function)
+                logger.warning(f"torch.compile of the COVE-Q dequantisation failed ({e!r}); eager")
+                cls.fn = kivi_unpack
+        return cls.fn
+
+    @classmethod
+    def call(cls, fn, p, bits, along, dtype):
+        if fn is kivi_unpack:
+            return fn(p, bits, along, dtype)
+        try:
+            return fn(p, bits, along, dtype)
+        except Exception as e:                           # noqa: BLE001
+            logger.warning(f"compiled COVE-Q dequantisation failed at run time ({e!r}); eager from now on")
+            cls.fn = kivi_unpack
+            return kivi_unpack(p, bits, along, dtype)
+
+
+class CodedLayer(_DynamicLayer):
+    """
+    One layer of the COVE-Q cache on Hugging Face's DynamicCache: n_q coded tokens (kivi_pack,
+    lo / scale in the model dtype) plus the exact part DynamicLayer already keeps (sinks + window,
+    then every appended question / generated token).  update() appends exactly as DynamicLayer and
+    returns [dequantised codes ; exact part]: the codes are dequantised into a TRANSIENT tensor of
+    this layer only (freed after its attention), so the stored cache is the codes and the model's
+    own SDPA reads them.  Key order inside the context is immaterial: every context key precedes
+    every question / generated position, and the causal mask is built from get_seq_length().
+    """
+
+    def __init__(self, keys, values, pk, pv, bits: int, n_q: int, unpack=kivi_unpack):
+        super().__init__()
+        self.dtype, self.device = keys.dtype, keys.device
+        self.keys, self.values, self.is_initialized = keys, values, True
+        self.pk, self.pv, self.bits, self.n_q, self.unpack = pk, pv, bits, n_q, unpack
+
+    def dequantised(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if Unpacker.fn is kivi_unpack:          # the compiled function failed earlier in the run: eager
+            self.unpack = kivi_unpack
+        return (Unpacker.call(self.unpack, self.pk, self.bits, True, self.dtype),
+                Unpacker.call(self.unpack, self.pv, self.bits, False, self.dtype))
+
+    def update(self, key_states, value_states, cache_kwargs=None):
+        self.keys = torch.cat([self.keys, key_states], dim=-2)
+        self.values = torch.cat([self.values, value_states], dim=-2)
+        Kd, Vd = self.dequantised()
+        return torch.cat([Kd, self.keys], dim=-2), torch.cat([Vd, self.values], dim=-2)
+
+    def get_seq_length(self) -> int:
+        return self.n_q + self.keys.shape[-2]
+
+    def crop(self, max_length: int) -> None:
+        raise NotImplementedError("a COVE-Q layer is never cropped")
+
+    def payload_bytes(self) -> int:
+        return tensor_bytes([self.keys, self.values]) + tensor_bytes(self.pk) + tensor_bytes(self.pv)
+
+
+def coded_fraction(n_keep: int, n_q: int, bits: Optional[int], H: int, elem: int, cfg: "Config") -> float:
+    """Analytic stored fraction of the full context cache when exact rows, scales and zero points take
+    `elem` bytes (the model dtype): (n_exact e + n_q (b + 2 e / KIVI_GROUP)) / (e H), e = 8 elem bits.
+    For a 16-bit model this is cove_q_plan's budget accounting exactly."""
+    e = 8.0 * elem
+    return ((n_keep - n_q) * e + (n_q * (bits + 2 * e / cfg.KIVI_GROUP) if n_q else 0.0)) / (e * H)
+
+
 @torch.no_grad()
 def native_cove_generate(runner: "Runner", method: "CoveMethod", ids: List[int], context_len: int, max_new: int,
                          stop_ids: set, stop_fn=None) -> Tuple[List[int], Dict]:
@@ -1211,9 +1452,10 @@ def native_cove_generate(runner: "Runner", method: "CoveMethod", ids: List[int],
     COVE as it is deployed, on the same path as the official kvpress presses (Hugging Face SDPA +
     DynamicCache, model dtype): the context is prefilled into the model's cache (query rows kept at
     the coverage positions only), every layer's cache is replaced IN PLACE by the dense
-    (1, Hkv, n_keep, d) selection, and the question and greedy decoding run through the model's own
-    attention kernel.  compress_s is the selection time of all layers; ttft_s = prefill + compression
-    + question; cache_bytes_measured is the size of the compressed cache tensors.
+    (1, Hkv, n_keep, d) selection (COVE-Q: by a CodedLayer, the n_q coded tokens + the exact sinks
+    and window), and the question and greedy decoding run through the model's own attention kernel.
+    compress_s is the selection (and coding) time of all layers; ttft_s = prefill + compression +
+    question; cache_bytes_measured is the size of the stored cache tensors (codes, scales, exact rows).
     """
     from transformers import DynamicCache
     if Router.active is not None:
@@ -1230,9 +1472,23 @@ def native_cove_generate(runner: "Runner", method: "CoveMethod", ids: List[int],
         h = model.model(input_ids=torch.tensor([ids[:H]], device=DEVICE), past_key_values=cache).last_hidden_state
     _sync()
     prefill_s = time.perf_counter() - t0
-    n_keep = min(kvpress_n_kept(H, method.keep), H)
+    n_keep, n_q = method.plan(H)
     t1 = time.perf_counter()
-    if n_keep < H:
+    if n_q:
+        c = runner.cfg
+        rs, re = min(c.N_SINK, H), max(min(c.N_SINK, H), H - c.WINDOW)
+        ex = torch.cat([torch.arange(rs), torch.arange(re, H)]).to(DEVICE)
+        for li, lay in enumerate(cache.layers):
+            K, V = lay.keys, lay.values
+            idx = method.select(li, QRows(cap.Q[li], keep_q, H), K, V, cap.scaling[li], H)
+            g = idx[None, :, rs:rs + n_q, None].expand(1, K.shape[1], n_q, K.shape[-1])
+            pk = kivi_pack(K.gather(2, g), method.bits, c.KIVI_GROUP, True, K.dtype)
+            pv = kivi_pack(V.gather(2, g), method.bits, c.KIVI_GROUP, False, V.dtype)
+            cache.layers[li] = CodedLayer(K[:, :, ex].contiguous(), V[:, :, ex].contiguous(), pk, pv, method.bits, n_q,
+                                          Unpacker.get(c))
+            cap.Q[li] = None
+            K = V = lay = None
+    elif n_keep < H:
         for li, lay in enumerate(cache.layers):
             K, V = lay.keys, lay.values
             idx = method.select(li, QRows(cap.Q[li], keep_q, H), K, V, cap.scaling[li], H)
@@ -1242,7 +1498,8 @@ def native_cove_generate(runner: "Runner", method: "CoveMethod", ids: List[int],
     _sync()
     compress_s = time.perf_counter() - t1
     peak_prefill = _peak()
-    cache_bytes = sum(tensor_bytes([lay.keys, lay.values]) for lay in cache.layers)
+    cache_bytes = sum(lay.payload_bytes() if isinstance(lay, CodedLayer) else tensor_bytes([lay.keys, lay.values])
+                      for lay in cache.layers)
     t2 = time.perf_counter()
     if len(ids) > H:
         pos = torch.arange(H, len(ids), device=DEVICE)[None]
@@ -1259,7 +1516,8 @@ def native_cove_generate(runner: "Runner", method: "CoveMethod", ids: List[int],
     info = {"prompt_len": len(ids), "context_len": H, "prefill_s": prefill_s, "compress_s": compress_s,
             "ttft_s": ttft_s, "peak_prefill_bytes": peak_prefill, "path": "native", "full_cache_bytes": float(full_bytes),
             "model_dtype": str(next(model.parameters()).dtype), "attention_dtype": "model dtype (SDPA)",
-            "cache_bytes_measured": float(cache_bytes), "memory_fraction": n_keep / H,
+            "cache_bytes_measured": float(cache_bytes), "n_kept": n_keep, "n_coded": n_q,
+            "memory_fraction": coded_fraction(n_keep, n_q, method.bits, H, next(model.parameters()).element_size(), runner.cfg),
             "memory_fraction_measured": cache_bytes / full_bytes, **run_flags(),
             "attn_flops_first_step": 4.0 * runner.d * runner.Hq * runner.L * (n_keep + len(ids) - H + 1),
             "attn_flops_first_step_full": 4.0 * runner.d * (len(ids) + 1) * runner.Hq * runner.L}
@@ -1290,9 +1548,12 @@ def attention_microbench(cfg: "Config", d: int = 128, Hkv: int = 8, rep: int = 4
     """
     One decode step of attention for one layer: SDPA over the full cache vs SDPA over the COVE
     cache at every budget (the decode path COVE uses, identical to any evicting method's at the
-    same token count), plus COVE's compression time for that layer (coverage scores + selection,
-    GPU-synchronised wall clock) on a synthetic layer.  On CUDA the attention calls are captured in
-    CUDA graphs and replayed; on CPU they are timed eagerly.
+    same token count) vs COVE-Q at the same bytes (dequantise this layer's codes into a transient
+    tensor, concatenate the exact sinks + window, SDPA: exactly CodedLayer.update + the model's
+    attention), plus the compression time for that layer (scores + selection [+ coding],
+    GPU-synchronised wall clock) on a synthetic layer.  us_per_step: CUDA-graph replay (kernel
+    time); us_per_step_eager: synchronised eager calls (launch overheads included, as in
+    un-graphed Hugging Face decoding).  On CPU both are eager.
     """
     dtype = dtype or (COMPUTE_DTYPE if DEVICE.type == "cuda" else torch.float32)
     rows = []
@@ -1307,33 +1568,60 @@ def attention_microbench(cfg: "Config", d: int = 128, Hkv: int = 8, rep: int = 4
         Qc = (torch.randn(1, Hkv * rep, len(keep_q), d, generator=g) * spec.sqrt()).to(DEVICE, dtype)
         q1 = torch.randn(1, Hkv * rep, 1, d, generator=g).to(DEVICE, dtype)
         full = lambda: F.scaled_dot_product_attention(q1, Kc, Vc, enable_gqa=True)
-        base = _time_callable(full, cfg)
-        rows.append({"context": H, "method": "full_sdpa", "us_per_step": base, "cache_bytes": tensor_bytes([Kc, Vc]),
-                     "speedup_vs_full": 1.0, "compress_us": 0.0})
+        base, base_e = _time_callable(full, cfg), _time_callable(full, cfg, graph=False)
+        rows.append({"context": H, "method": "full_sdpa", "us_per_step": base, "us_per_step_eager": base_e,
+                     "cache_bytes": tensor_bytes([Kc, Vc]), "n_tokens_read": H, "speedup_vs_full": 1.0,
+                     "speedup_vs_full_eager": 1.0, "compress_us": 0.0})
+        rs, re = min(cfg.N_SINK, H), max(min(cfg.N_SINK, H), H - cfg.WINDOW)
+        ex = torch.cat([torch.arange(rs), torch.arange(re, H)]).to(DEVICE)
         for keep in cfg.KEEP_FRACTIONS:
-            m = CoveMethod(cfg, keep, f"cove@{keep:g}", fake)
-            _sync()
-            t = time.perf_counter()
-            idx = m.select(0, QRows(Qc, keep_q, H), Kc, Vc, d ** -0.5, H)
-            _sync()
-            comp = (time.perf_counter() - t) * 1e6
-            gi = idx[None, :, :, None].expand(1, Hkv, idx.shape[-1], d)
-            Ke, Ve = Kc.gather(2, gi).contiguous(), Vc.gather(2, gi).contiguous()
-            us = _time_callable(lambda Ke=Ke, Ve=Ve: F.scaled_dot_product_attention(q1, Ke, Ve, enable_gqa=True), cfg)
-            rows.append({"context": H, "method": f"cove@{keep:g}", "us_per_step": us, "cache_bytes": tensor_bytes([Ke, Ve]),
-                         "speedup_vs_full": base / us if us > 0 else float("nan"), "compress_us": comp})
+            for bits in (None,) + tuple(cfg.COVE_Q_BITS):
+                m = CoveMethod(cfg, keep, f"cove@{keep:g}" if bits is None else f"cove_q{bits}@{keep:g}", fake, bits=bits)
+                n_keep, n_q = m.plan(H)
+                if bits is not None and n_q == 0:
+                    continue
+                _sync()
+                t = time.perf_counter()
+                idx = m.select(0, QRows(Qc, keep_q, H), Kc, Vc, d ** -0.5, H)
+                if bits is None:
+                    gi = idx[None, :, :, None].expand(1, Hkv, idx.shape[-1], d)
+                    Ke, Ve = Kc.gather(2, gi).contiguous(), Vc.gather(2, gi).contiguous()
+                    fn = lambda Ke=Ke, Ve=Ve: F.scaled_dot_product_attention(q1, Ke, Ve, enable_gqa=True)
+                    nbytes = tensor_bytes([Ke, Ve])
+                else:
+                    gi = idx[None, :, rs:rs + n_q, None].expand(1, Hkv, n_q, d)
+                    lay = CodedLayer(Kc[:, :, ex].contiguous(), Vc[:, :, ex].contiguous(),
+                                     kivi_pack(Kc.gather(2, gi), bits, cfg.KIVI_GROUP, True, dtype),
+                                     kivi_pack(Vc.gather(2, gi), bits, cfg.KIVI_GROUP, False, dtype), bits, n_q,
+                                     Unpacker.get(cfg))
+
+                    def fn(lay=lay):
+                        Kd, Vd = lay.dequantised()
+                        return F.scaled_dot_product_attention(q1, torch.cat([Kd, lay.keys], 2),
+                                                              torch.cat([Vd, lay.values], 2), enable_gqa=True)
+                    nbytes = lay.payload_bytes()
+                _sync()
+                comp = (time.perf_counter() - t) * 1e6
+                us, us_e = _time_callable(fn, cfg), _time_callable(fn, cfg, graph=False)
+                rows.append({"context": H, "method": m.name, "us_per_step": us, "us_per_step_eager": us_e,
+                             "dequant": "" if bits is None else ("compiled" if Unpacker.get(cfg) is not kivi_unpack
+                                                                 else "eager"),
+                             "cache_bytes": nbytes, "n_tokens_read": n_keep,
+                             "speedup_vs_full": base / us if us > 0 else float("nan"),
+                             "speedup_vs_full_eager": base_e / us_e if us_e > 0 else float("nan"), "compress_us": comp})
         logger.info("  microbench H=%d: " % H + ", ".join(
-            f"{r['method']}={r['us_per_step']:.1f}us/{r['cache_bytes'] / 2**20:.2f}MiB (x{r['speedup_vs_full']:.2f}, "
-            f"compress {r['compress_us'] / 1e3:.1f}ms)" for r in rows if r["context"] == H))
+            f"{r['method']}={r['us_per_step']:.1f}us[eager {r['us_per_step_eager']:.1f}]/{r['cache_bytes'] / 2**20:.2f}MiB "
+            f"(x{r['speedup_vs_full']:.2f}, compress {r['compress_us'] / 1e3:.1f}ms)" for r in rows if r["context"] == H))
     return pd.DataFrame(rows).assign(device=str(DEVICE), dtype=str(dtype),
                                      timer="cuda_graph" if DEVICE.type == "cuda" else "eager_cpu")
 
 
-def _time_callable(fn, cfg: "Config") -> float:
-    """Median microseconds of fn(); CUDA: captured once in a CUDA graph, then replayed (falls back
-    to eager timing if capture fails, recorded in the log)."""
+def _time_callable(fn, cfg: "Config", graph: bool = True) -> float:
+    """Median microseconds of fn(); CUDA with graph: captured once in a CUDA graph, then replayed
+    (kernel time without launch overhead; falls back to eager timing if capture fails, recorded in
+    the log); otherwise eager, synchronised per call (what un-graphed Hugging Face decoding pays)."""
     reps = cfg.MICRO_REPEATS
-    if DEVICE.type == "cuda":
+    if DEVICE.type == "cuda" and graph:
         try:
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -1496,6 +1784,63 @@ def cove_tests(cfg: "Config") -> Dict:
     full = CoveMethod(tc, 1.0, "all", fr).select(0, Q, K, Vx, dd ** -0.5, H)
     if not torch.equal(full, torch.arange(H).expand(Hkv, H)):
         raise RuntimeError("a budget of the whole context must keep every token")
+    # COVE-Q: the stored codes are KIVI's (same dequantisation), the payload is the analytic size,
+    # the plan is bytes-matched and maximal, the coded layer returns [codes ; exact part]
+    worst_q = 0.0
+    for bits in (2, 4):
+        for along in (True, False):
+            x = torch.randn(1, 2, 4 * tc.KIVI_GROUP, 64, generator=g) * 2 + 0.5
+            pk = kivi_pack(x, bits, tc.KIVI_GROUP, along, torch.float16)
+            ref = kivi_quant(x, bits, tc.KIVI_GROUP, along, 0)["xhat"]
+            worst_q = max(worst_q, float((kivi_unpack(pk, bits, along, torch.float32) - ref).abs().max()))
+            if tensor_bytes(pk) != x.numel() * (bits / 8 + 4 / tc.KIVI_GROUP):     # codes + fp16 lo, scale per group
+                raise RuntimeError("COVE-Q payload differs from its analytic size")
+    out["coveq_unpack_vs_kivi_max_abs"] = worst_q
+    if worst_q > 1e-6:
+        raise RuntimeError(f"COVE-Q codes do not dequantise as KIVI's ({worst_q})")
+    for H_ in (300, 700, 5000):
+        rs_, re_ = min(tc.N_SINK, H_), max(min(tc.N_SINK, H_), H_ - tc.WINDOW)
+        for keep in (0.0625, 0.125, 0.25, 0.5, 1.0):
+            for bits in (2, 4):
+                bt = kvpress_n_kept(H_, keep)
+                nk, nq = cove_q_plan(H_, bt, bits, tc)
+                be = tc.kivi_effective_bits(bits)
+                used = (nk - nq) * 16 + nq * be
+                more = nq + tc.KIVI_GROUP <= re_ - rs_ and used + tc.KIVI_GROUP * be <= bt * 16
+                if used > bt * 16 + 1e-9 or nq % tc.KIVI_GROUP or more or nk > H_:
+                    raise RuntimeError(f"COVE-Q plan not bytes-matched / maximal at H={H_} keep={keep} b={bits}")
+    if _DynamicLayer is not object:
+        ex_k, ex_v = torch.randn(1, 2, 12, 64, generator=g), torch.randn(1, 2, 12, 64, generator=g)
+        x = torch.randn(1, 2, 2 * tc.KIVI_GROUP, 64, generator=g)
+        lay = CodedLayer(ex_k, ex_v, kivi_pack(x, 4, tc.KIVI_GROUP, True, torch.float32),
+                         kivi_pack(x, 4, tc.KIVI_GROUP, False, torch.float32), 4, x.shape[2])
+        nk_, nv_ = torch.randn(1, 2, 1, 64, generator=g), torch.randn(1, 2, 1, 64, generator=g)
+        Ko, Vo = lay.update(nk_, nv_)
+        Kw = torch.cat([kivi_unpack(lay.pk, 4, True, torch.float32), ex_k, nk_], 2)
+        Vw = torch.cat([kivi_unpack(lay.pv, 4, False, torch.float32), ex_v, nv_], 2)
+        if not (torch.equal(Ko, Kw) and torch.equal(Vo, Vw) and lay.get_seq_length() == x.shape[2] + 13):
+            raise RuntimeError("CodedLayer must return [dequantised codes ; exact part ; new tokens]")
+    # Prop. 4 (eviction + coding, first order): ||o'' - o|| <= eviction bound + max ||e_v|| +
+    # max |delta - mean delta| * sum p' ||v - o'||  for small key perturbations delta_j = q . dk_j
+    worst4 = 0.0
+    for _ in range(100):
+        lg = torch.randn(n, generator=g, dtype=torch.float64) * 2
+        p = lg.softmax(0)
+        S = torch.rand(n, generator=g) < 0.5
+        Kp = ~S
+        dl = torch.randn(n, generator=g, dtype=torch.float64) * 1e-3          # logit perturbation (key codes)
+        eV = torch.randn(n, d, generator=g, dtype=torch.float64) * 1e-2        # value codes
+        p1 = (lg.masked_fill(S, float("-inf"))).softmax(0)                     # evicted
+        p2 = (lg + dl).masked_fill(S, float("-inf")).softmax(0)                # evicted + coded keys
+        o, o1 = p @ V, p1 @ V
+        o2 = p2 @ (V + eV)
+        dm = (p1 * dl).sum()
+        bound = float((p * S * (V - o).norm(dim=-1)).sum() / (1 - (p * S).sum())) + float(eV[Kp].norm(dim=-1).max()) + \
+            float((dl - dm)[Kp].abs().max()) * float((p1 * (V - o1).norm(dim=-1)).sum())
+        worst4 = max(worst4, float((o2 - o).norm()) / bound)
+    out["prop4_norm_over_bound_max"] = worst4
+    if worst4 > 1 + 1e-3:
+        raise RuntimeError(f"Prop. 4 bound failed ({worst4})")
     logger.info("cove tests: " + ", ".join(f"{k_}={v_:.4g}" for k_, v_ in out.items()))
     return out
 
@@ -2108,7 +2453,9 @@ def build_press(name: str, keep: float):
                "expected_attention": lambda: K.AdaKVPress(K.ExpectedAttentionPress(epsilon=1e-2)),
                "tova": lambda: K.TOVAPress(), "knorm": lambda: K.KnormPress(),
                "streaming_llm": lambda: K.StreamingLLMPress(),
-               "kvzip": lambda: K.KVzipPress(), "compactor": lambda: K.CompactorPress()}
+               "kvzip": lambda: K.KVzipPress(), "compactor": lambda: K.CompactorPress(),
+               "criticalkv": lambda: K.CriticalKVPress(K.SnapKVPress()),   # kvpress registry's criti_snapkv
+               "keydiff": lambda: K.KeyDiffPress(), "kvgrad": lambda: K.KVgradPress()}
     press = presses[name]()
     press.compression_ratio = 1.0 - keep       # as evaluate.py: set after construction (AdaKV delegates)
     return press
@@ -2120,18 +2467,20 @@ def kvpress_n_kept(k_len: int, keep: float) -> int:
     return 0 if ratio >= 1.0 else max(1, int(k_len * (1 - ratio)))
 
 
-MASKING_PRESSES = ("adakv_snapkv", "expected_attention", "kvzip")   # they mask keys: memory is nominal
+MASKING_PRESSES = ("adakv_snapkv", "expected_attention", "kvzip", "kvgrad")   # they mask keys: memory is nominal
 ALWAYS_RUN = ("full", "native_full")                        # references of every contrast / path control
 
 
 COVE_VARIANTS = {"cove": {},
                  "cove_window": {"window_only": True},   # end-window scores (SnapKV-type prior)
                  "cove_l2": {"score": "l2"},              # independent-error (squared) price
-                 "cove_pool5": {"pool": 5}}               # SnapKV-style smoothing of the scores
+                 "cove_pool5": {"pool": 5},               # SnapKV-style smoothing of the scores
+                 "cove_q2": {"bits": 2},                  # COVE-Q: more tokens at KIVI-2 (bytes-matched)
+                 "cove_q4": {"bits": 4}}                  # COVE-Q: more tokens at KIVI-4 (bytes-matched)
 
 
 def bench_specs(cfg: "Config", for_ppl: bool = False) -> List[BenchSpec]:
-    """Every method at every budget (COVE's ablations and its harness twin at PRIMARY_KEEP)."""
+    """Every method at every budget (COVE's ablations and the harness twins at PRIMARY_KEEP)."""
     out = [BenchSpec("full", "full")] + [BenchSpec(f"kivi{b}", "kivi", kivi_bits=b) for b in cfg.KIVI_BITS]
     if not for_ppl:
         out.append(BenchSpec("native_full", "native"))       # HF SDPA + DynamicCache reference
@@ -2143,10 +2492,14 @@ def bench_specs(cfg: "Config", for_ppl: bool = False) -> List[BenchSpec]:
         out += [BenchSpec(f"snapkv_q{b}@{t}", "mtlp", r, kivi_bits=b) for b in cfg.MTLP_BITS]
         out += [BenchSpec(f"{fam}@{t}", "chunk", r, chunk=chunk_method(f"{fam}@{t}", fam, 1.0)) for fam in ("evict", "am")]
         out.append(BenchSpec(f"cove@{t}", "cove", r, variant="cove"))
+        out += [BenchSpec(f"cove_q{b}@{t}", "cove", r, variant=f"cove_q{b}") for b in cfg.COVE_Q_BITS]
     r0 = f"{cfg.PRIMARY_KEEP:g}"
     out += [BenchSpec(f"{v_}@{r0}", "cove", cfg.PRIMARY_KEEP, variant=v_)
             for v_ in ("cove_window", "cove_l2", "cove_pool5")]
-    out.append(BenchSpec(f"cove_ref@{r0}", "cove_ref", cfg.PRIMARY_KEEP, variant="cove"))   # harness twin
+    out.append(BenchSpec(f"cove_ref@{r0}", "cove_ref", cfg.PRIMARY_KEEP, variant="cove"))   # harness twins
+    if cfg.COVE_Q_BITS:
+        bq = cfg.COVE_Q_BITS[-1]
+        out.append(BenchSpec(f"cove_q{bq}_ref@{r0}", "cove_ref", cfg.PRIMARY_KEEP, variant=f"cove_q{bq}"))
     if cfg.BENCH_INCLUDE_CLA:
         out.append(BenchSpec("cla", "cla"))
     if cfg.BENCH_METHODS:                                  # e.g. ("cove@", "snapkv@")
@@ -2255,6 +2608,8 @@ def payload_bytes(method: LayerMethod, context_len: int) -> int:
             for part in ((method.stored[li]["k"], method.stored[li]["v"]) if li in method.stored else ()):
                 total += tensor_bytes(pack_codes(part["codes"], method.bits)) + \
                     tensor_bytes(part["lo"].half()) + tensor_bytes(part["scale"].half())
+        elif isinstance(method, CoveMethod):
+            total += tensor_bytes(method.stored.get(li, {}))      # COVE-Q: packed codes + fp16 lo / scale
         elif st.tok is not None:
             kb = method.keep_bits
             for x in (st.tok["k"], st.tok["v"]):
@@ -2570,7 +2925,7 @@ def generation_equivalence(runner: "Runner", specs: List[BenchSpec], ids: List[i
         if spec.family == "cove":
             m, _ = make_method(spec, context_len, runner, cfg)
             gen, inf = native_cove_generate(runner, m, ids, context_len, n_new, set())
-            twin = f"cove_ref@{spec.keep:g}"
+            twin = f"{spec.variant}_ref@{spec.keep:g}"
             row = {"method": spec.name, "n_tokens": len(gen), "note": "deployment path (HF SDPA, compressed cache)",
                    "harness_twin": twin, "memory_fraction_measured": inf["memory_fraction_measured"],
                    "memory_fraction": inf["memory_fraction"]}
@@ -2937,20 +3292,65 @@ def write_predictions(preds_path: str, done: set, out_dir: str):
 
 
 def bench_contrasts(cfg: "Config") -> List[Tuple[str, str, str]]:
-    """Pre-registered contrasts (A better than B is the hypothesis; harness checks are two-sided)."""
+    """
+    Pre-registered contrasts.  Superiority (A better than B): COVE against every baseline at every
+    budget, COVE-Q against COVE at the same bytes (more tokens at lower precision) and against
+    SnapKV + KIVI-b at the same code (the selection).  Non-inferiority (prefix NI:, A no worse
+    than B by more than the margin; B the full cache on A's path): every COVE arm and the
+    strongest baselines.  Harness checks (prefix harness_check:) are two-sided implementation
+    checks and never enter decision rules.
+    """
     out = []
     for r in cfg.KEEP_FRACTIONS:
         t = f"{r:g}"
         out += [(f"cove_vs_kvpress:{pn}@{t}", f"cove@{t}", f"kvpress:{pn}@{t}") for pn in cfg.KVPRESS_PRESSES]
         out += [(f"cove_vs_{b_}@{t}", f"cove@{t}", f"{b_}@{t}")
                 for b_ in ["snapkv", "streamingllm", "evict", "am"] + [f"snapkv_q{b}" for b in cfg.MTLP_BITS]]
+        for b in cfg.COVE_Q_BITS:
+            out.append((f"cove_q{b}_vs_cove@{t}", f"cove_q{b}@{t}", f"cove@{t}"))
+            if b in cfg.MTLP_BITS:
+                out.append((f"cove_q{b}_vs_snapkv_q{b}@{t}", f"cove_q{b}@{t}", f"snapkv_q{b}@{t}"))
+            out.append((f"cove_q{b}_vs_kvpress:kvzip@{t}", f"cove_q{b}@{t}", f"kvpress:kvzip@{t}"))
+        ni_native = [f"cove@{t}"] + [f"cove_q{b}@{t}" for b in cfg.COVE_Q_BITS]
+        ni_native += [f"kvpress:{pn}@{t}" for pn in ("snapkv", "kvzip", "criticalkv") if pn in cfg.KVPRESS_PRESSES]
+        out += [(f"{NI_PREFIX}{A}_vs_native_full", A, "native_full") for A in ni_native]
+        out += [(f"{NI_PREFIX}snapkv_q{b}@{t}_vs_full", f"snapkv_q{b}@{t}", "full") for b in cfg.MTLP_BITS]
         out.append((f"{HARNESS_CHECK}snapkv@{t}", f"snapkv@{t}", f"kvpress:snapkv@{t}"))
     t0 = f"{cfg.PRIMARY_KEEP:g}"
     out += [(f"cove_vs_{b_}@{t0}", f"cove@{t0}", f"{b_}@{t0}") for b_ in ("cove_window", "cove_l2", "cove_pool5")]
     out += [(f"cove@{t0}_vs_kivi{b}", f"cove@{t0}", f"kivi{b}") for b in cfg.KIVI_BITS]
     out.append((f"{HARNESS_CHECK}cove@{t0}", f"cove@{t0}", f"cove_ref@{t0}"))
+    if cfg.COVE_Q_BITS:
+        bq = cfg.COVE_Q_BITS[-1]
+        out.append((f"{HARNESS_CHECK}cove_q{bq}@{t0}", f"cove_q{bq}@{t0}", f"cove_q{bq}_ref@{t0}"))
     out.append((f"{HARNESS_CHECK}full", "full", "native_full"))
     return out
+
+
+NI_PREFIX = "NI:"                   # non-inferiority contrasts (one-sided, margin Config.NI_MARGIN*)
+
+
+def ni_margin(bench: str, cfg: "Config") -> float:
+    return cfg.NI_MARGIN_PPL if bench.startswith("longppl") else cfg.NI_MARGIN
+
+
+def ni_p_value(d: np.ndarray, strata: np.ndarray, margin: float, cfg: "Config") -> float:
+    """
+    One-sided p of H0: macro mean of A - B <= -margin, by inverting the task-stratified percentile
+    bootstrap of paired_score_test (same seed, same draws, so p < 0.025 iff its 95% CI lies above
+    -margin): p = (1 + #{bootstrap means <= -margin}) / (N_BOOT + 1).  No symmetry is assumed: items
+    that both methods fail give d = 0 exactly, a point mass that a sign-flip test of d + margin would
+    read as evidence.  Decisions also require NI_MIN_UNITS paired units (bootstrap validity).
+    """
+    if len(d) == 0:
+        return float("nan")
+    rng = np.random.default_rng(SEED)
+    tasks = np.unique(strata)
+    boot = np.zeros(cfg.N_BOOT)
+    for t in tasks:
+        x = d[strata == t]
+        boot += x[rng.integers(0, len(x), size=(cfg.N_BOOT, len(x)))].mean(1) / len(tasks)
+    return float((1 + np.sum(boot <= -margin)) / (cfg.N_BOOT + 1))
 
 HARNESS_CHECK = "harness_check:"    # two-sided implementation checks; never enter decision rules
 
@@ -3066,9 +3466,10 @@ def bench_analysis(df: pd.DataFrame, cfg: "Config", model: str, family: str, out
                 continue
             m = ga[["unit", "task", "score", "memory_fraction", "keep_budget"]].merge(
                 gb[["unit", "score", "memory_fraction", "keep_budget"]], on="unit", suffixes=("_a", "_b"))
-            check = name.startswith(HARNESS_CHECK)
+            check, ni = name.startswith(HARNESS_CHECK), name.startswith(NI_PREFIX)
             cross = path_of[A] != path_of[B] and not check
-            role = "check" if check else ("uncontrolled_cross_path" if cross and gap is None else "hypothesis")
+            role = "check" if check else ("uncontrolled_cross_path" if cross and gap is None else
+                                          "noninferiority" if ni else "hypothesis")
             if cross and gap is not None:
                 m = m.merge(gap, on="unit")
             tol = 1 + cfg.BUDGET_TOL
@@ -3093,17 +3494,29 @@ def bench_analysis(df: pd.DataFrame, cfg: "Config", model: str, family: str, out
                          "score_B": float(m.score_b[ok].mean()) if ok.any() else float("nan"),
                          "estimate_unadjusted": paired_score_test(d_raw[ok], strata[ok], 1, 1, SEED)["estimate"],
                          "n_excluded_over_budget": int((~ok).sum()),
-                         "estimate_all_units": paired_score_test(d, strata, 1, 1, SEED)["estimate"], **r})
+                         "estimate_all_units": paired_score_test(d, strata, 1, 1, SEED)["estimate"],
+                         "margin": ni_margin(bench, cfg) if ni else float("nan"),
+                         "p_value_ni": ni_p_value(d[ok], strata[ok], ni_margin(bench, cfg), cfg) if ni else float("nan"),
+                         **r})
     ct = pd.DataFrame(rows)
     if len(ct):
         ct["p_holm"] = np.nan
         hyp = ct.role == "hypothesis"
         for bench, idx in ct[hyp].groupby("benchmark").groups.items():
             ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value"])
-        ct["supported"] = hyp & (ct.estimate > 0) & (ct.p_holm < cfg.ALPHA) & (ct.n_units > 0)
+        nif = ct.role == "noninferiority"                 # Holm within the non-inferiority family, one-sided
+        for bench, idx in ct[nif].groupby("benchmark").groups.items():
+            ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value_ni"])
+        ct["supported"] = (hyp & (ct.estimate > 0) & (ct.p_holm < cfg.ALPHA) & (ct.n_units > 0)) | \
+                          (nif & (ct.p_holm < cfg.ALPHA / 2) & (ct.ci_low > -ct.margin) &
+                           (ct.n_units >= cfg.NI_MIN_UNITS))
         ct.to_csv(os.path.join(out_dir, "bench_contrasts.csv"), index=False)
-        for r in ct[ct.role != "hypothesis"].itertuples():
+        for r in ct[~ct.role.isin(["hypothesis", "noninferiority"])].itertuples():
             logger.info(f"  {r.benchmark} {r.contrast} [{r.role}]: diff={r.estimate:+.3f} p={r.p_value:.3g}")
+        for r in ct[nif].itertuples():
+            logger.info(f"  {r.benchmark} {r.contrast}: diff={r.estimate:+.3f} [{r.ci_low:+.3f}, {r.ci_high:+.3f}] "
+                        f"margin {r.margin:g} p_ni(holm)={r.p_holm:.3g} -> "
+                        f"{'NON-INFERIOR' if r.supported else 'non-inferiority not shown'}")
     return ct
 
 
@@ -3114,7 +3527,9 @@ def bench_cross_model(cfg: "Config"):
     ct = pd.concat(cts, ignore_index=True)
     ct.to_csv(os.path.join(cfg.RESULTS_DIR, "bench_all_contrasts.csv"), index=False)
     if "role" in ct:                                        # harness checks never enter decisions
-        ct = ct[ct.role == "hypothesis"]
+        ct = ct[ct.role.isin(["hypothesis", "noninferiority"])]
+    if "margin" not in ct:
+        ct = ct.assign(margin=float("nan"))
     sysd = [pd.read_csv(p) for p in Path(cfg.RESULTS_DIR).glob("*/bench/bench_systems.csv")]
     if sysd:
         pd.concat(sysd, ignore_index=True).to_csv(os.path.join(cfg.RESULTS_DIR, "bench_all_systems.csv"), index=False)
@@ -3125,11 +3540,14 @@ def bench_cross_model(cfg: "Config"):
     for (bench, name), g in ct.groupby(["benchmark", "contrast"], sort=False):
         n = len(g)
         need = int(math.ceil(cfg.DECISION_MIN_MODEL_FRACTION * n))
-        pw = float(stats.wilcoxon(g.estimate, alternative="greater").pvalue) if n >= cfg.MIN_MODELS_WILCOXON \
+        ni = name.startswith(NI_PREFIX)           # non-inferiority: models' estimates + margin > 0, one-sided alpha / 2
+        shift = g.margin.fillna(0.0) if ni else 0.0
+        pw = float(stats.wilcoxon(g.estimate + shift, alternative="greater").pvalue) if n >= cfg.MIN_MODELS_WILCOXON \
             else float("nan")
         met = int(g.supported.sum())
         verdict = ("insufficient models" if n < cfg.MIN_MODELS_WILCOXON else
-                   "supported" if (met >= need and pw < cfg.ALPHA) else "not supported")
+                   ("non-inferior" if ni else "supported") if (met >= need and pw < cfg.ALPHA / (2 if ni else 1))
+                   else ("non-inferiority not shown" if ni else "not supported"))
         rows.append({"benchmark": bench, "contrast": name, "models_evaluated": n, "models_meeting_rule": met,
                      "models_required": need, "median_estimate": float(g.estimate.median()),
                      "p_wilcoxon_models": pw, "verdict": verdict})
@@ -3165,7 +3583,9 @@ def run_bench_model(mc: "ModelConfig", cfg: "Config", suites: Sequence[str], pre
     t0 = f"{cfg.PRIMARY_KEEP:g}"
     eq_specs = [s for s in bench_specs(cfg) if s.name in
                 ("full", "kivi2", f"snapkv@{t0}", f"streamingllm@{t0}", f"evict@{t0}", f"am@{t0}", f"snapkv_q4@{t0}",
-                 f"cove_ref@{t0}", f"cove@{t0}", "native_full", f"kvpress:snapkv@{t0}", f"kvpress:streaming_llm@{t0}")]
+                 f"cove_ref@{t0}", f"cove@{t0}", "native_full", f"kvpress:snapkv@{t0}", f"kvpress:streaming_llm@{t0}")
+                or (cfg.COVE_Q_BITS and s.name in (f"cove_q{cfg.COVE_Q_BITS[-1]}@{t0}",
+                                                   f"cove_q{cfg.COVE_Q_BITS[-1]}_ref@{t0}"))]
     generation_equivalence(runner, eq_specs, enc["ids"], enc["ctx_len"], 8, cfg).to_csv(
         os.path.join(out_dir, "generation_equivalence.csv"), index=False)
     attention_microbench(cfg, runner.d, runner.Hkv, runner.Hq // runner.Hkv).assign(model=mc.name).to_csv(
@@ -3288,7 +3708,8 @@ def progress_report(paths: Sequence[str], cfg: "Config", out_dir: str) -> pd.Dat
     What a partial run supports: per task, the mean score and number of items of every method, the
     share of items the FULL cache already fails (score 0: those items cannot discriminate between
     compressors), and every pre-registered contrast as a paired test over all items both methods
-    have (macro over tasks; bootstrap CI; sign-flip p; Holm per benchmark).  Individual log lines
+    have (macro over tasks; bootstrap CI; sign-flip p; Holm per benchmark; NI: contrasts are one-sided
+    non-inferiority tests at the pre-registered margin, Holm within their family).  Individual log lines
     are single draws of a noisy per-item metric (one F1 per item) and must never be read as results.
     """
     df = read_progress(paths)
@@ -3311,14 +3732,21 @@ def progress_report(paths: Sequence[str], cfg: "Config", out_dir: str) -> pd.Dat
                 continue
             d = (S[A] - S[B])[ok].to_numpy()
             r = paired_score_test(d, task_of[ok.to_numpy()], cfg.N_BOOT, cfg.N_PERM, SEED)
+            ni = name.startswith(NI_PREFIX)
+            mg = ni_margin(bench, cfg)
             rows.append({"benchmark": bench, "contrast": name, "A": A, "B": B,
-                         "score_A": float(S[A][ok].mean()), "score_B": float(S[B][ok].mean()), **r})
+                         "score_A": float(S[A][ok].mean()), "score_B": float(S[B][ok].mean()),
+                         "margin": mg if ni else float("nan"),
+                         "p_value_ni": ni_p_value(d, task_of[ok.to_numpy()], mg, cfg) if ni else float("nan"), **r})
     ct = pd.DataFrame(rows)
     if len(ct):
         ct["p_holm"] = np.nan
-        hyp = ~ct.contrast.str.startswith(HARNESS_CHECK)
+        nif = ct.contrast.str.startswith(NI_PREFIX)
+        hyp = ~ct.contrast.str.startswith(HARNESS_CHECK) & ~nif
         for _, idx in ct[hyp].groupby("benchmark").groups.items():
             ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value"])
+        for _, idx in ct[nif].groupby("benchmark").groups.items():
+            ct.loc[idx, "p_holm"] = holm(ct.loc[idx, "p_value_ni"])
     os.makedirs(out_dir, exist_ok=True)
     table.round(2).to_csv(os.path.join(out_dir, "report_scores.csv"))
     ct.to_csv(os.path.join(out_dir, "report_contrasts.csv"), index=False)
@@ -3329,8 +3757,10 @@ def progress_report(paths: Sequence[str], cfg: "Config", out_dir: str) -> pd.Dat
         col = macro[bench].dropna().sort_values(ascending=False)
         logger.info(f"REPORT {bench} macro mean over tasks:\n" + "\n".join(f"    {m_:<34} {v_:6.2f}" for m_, v_ in col.items()))
     for r in ct.itertuples():
-        logger.info(f"REPORT {r.benchmark} {r.contrast:<38} {r.estimate:+6.2f} [{r.ci_low:+.2f}, {r.ci_high:+.2f}] "
-                    f"p={r.p_value:.4f} holm={r.p_holm:.4f} n={r.n_units}")
+        tail = (f"margin {r.margin:g}: p_ni={r.p_value_ni:.4f} holm={r.p_holm:.4f}" if r.contrast.startswith(NI_PREFIX)
+                else f"p={r.p_value:.4f} holm={r.p_holm:.4f}")
+        logger.info(f"REPORT {r.benchmark} {r.contrast:<44} {r.estimate:+6.2f} [{r.ci_low:+.2f}, {r.ci_high:+.2f}] "
+                    f"{tail} n={r.n_units}")
     logger.info(f"REPORT written to {out_dir}")
     return ct
 
