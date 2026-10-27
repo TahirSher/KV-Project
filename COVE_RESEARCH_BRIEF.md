@@ -1,166 +1,165 @@
-# COVE-KV v2: Research Brief
+# COVE-KV v3: Research Brief
 
-This brief answers the six questions of `Code_Assessments.md` for `COVE_KV.py` v2. It replaces the v1 brief and `STRATA_RESEARCH_BRIEF.md`.
+This brief covers `COVE_KV.py` v3. It answers the six questions of `Code_Assessments.md` and replaces the v2 brief.
 
-v2 adds three things:
-- **COVE-Q**, a quantised arm: the same token selection, with more tokens kept at lower precision for the same bytes.
-- **The closest published baselines** that kvpress 0.5.5 ships: CriticalKV, KeyDiff and KVgrad.
-- **A formal non-inferiority test**, so that "without losing results" becomes a statement that can be falsified.
-
-**Evidence base:**
-- HEDGE_KV v2: SmolLM3-3B, 81 qasper items.
-- QUASAR_KV: Llama-3.2-1B, 670 paired LongBench items.
-- STRATA_KV: Llama-3.2-1B, GPU decode microbenchmark and two partial runs. The latest has 4 qasper items, because out-of-memory errors from other processes on the shared GPU stopped the rest.
-
-**Literature:** searched in October 2026. Venues marked * were not verified against the proceedings, and full texts could not be fetched. Read the papers in §5 in full before claiming novelty.
+**New evidence:**
+- **Source:** the v2 run on Qwen2.5-3B-Instruct, LongBench qasper, 167 paired items, 72 methods.
+- **Comparison basis:** all differences are paired per item and compared against the full cache on the same path (`native_full`, bf16 SDPA). Intervals are 95% task-stratified bootstrap CIs; p-values come from a sign-flip test with Holm correction per benchmark.
+- **Scope:** one model and one task, so no general claim follows from it.
 
 ---
 
-## 1. Objective and rationale
+## 1. Objective, and what the v2 run says about it
 
-**Objective.** Compress the KV cache of long-context LLMs by 4–16× and decode faster than with the full cache, losing no more than a pre-registered margin of task accuracy. There is no training or calibration. The context is compressed once, before the question is known (the kvpress protocol).
+**Objective.** Smaller KV memory and faster inference, with no loss beyond a pre-registered margin. No training is involved, and the context is compressed before the question is known.
 
-**What our own measurements force on the design.** These are measured on your GPU, not assumed.
+### 1.1 Accuracy (score points)
 
-| Finding | Evidence |
-|---|---|
-| Reading fewer tokens through the model's own SDPA is the only route that was faster in practice | One layer, 64k tokens: full SDPA 90.8 µs; SDPA over 1/8 of the tokens 20.3 µs (4.5× faster); over 1/16, 15.0 µs (6.0×) |
-| Our mixed-precision kernels were slower than the full cache | STRATA kernel: 259–342 µs at 64k, 3–4× slower than full; QUASAR ≥ 4 ms |
-| Mixed precision cost time end to end | STRATA compression took 1.63 s after a 0.15 s prefill. Its time to first token (TTFT) was 1.45 s against 0.24 s for the full cache. |
-| Pricing tokens by the context's own queries over its whole length carried accuracy every time | +9.1 / +18.6 points (HedgeKV, 1/8 and 1/16); +4.2 (QUASAR, 1/8); all p ≤ 0.001 |
+| | 1/4 memory | 1/8 | 1/16 |
+|---|---|---|---|
+| `cove` (exact tokens) vs full | **−5.8** [−10.5, −1.3] | **−12.7** | **−19.2** |
+| `cove_q4` vs full | **+0.1** [−1.7, +2.0] | −4.4 | −8.9 |
+| `cove_q2` vs full | −2.9 | −3.8 | −8.0 |
+| `cove_q4` vs `cove`, same bytes | +6.0 | **+8.3** | **+10.2** |
+| `cove_q4` vs SnapKV + KIVI-4 (MTLP) | +0.9 | **+10.4** | **+9.1** |
+| `cove` vs kvpress SnapKV / Compactor (real memory) | +8.7 / +1.9 | +7.5 / +2.1 | +4.0 / −1.4 |
+| `cove` vs KVgrad / KVzip (masked keys, nominal memory) | −5.5 / −2.7 | −5.8 / −0.1 | +0.4 / +8.9 |
 
-**Rationale.**
-- **Speed:** COVE evicts. Its kept tokens form a dense bf16 cache read by SDPA, so its decode cost is attention over `n_keep` tokens.
-- **Accuracy:** COVE-Q spends the same bytes on 3–5× more tokens as KIVI codes. This is where quantisation helps: memory, not speed.
-- **What you asked for and what the data allows:** you want quantisation to deliver speed, memory and accuracy together. No method in our data did all three at once. At equal bytes, quantisation buys accuracy (more context kept) and costs decode time. Eviction buys decode time. COVE gives you both points on the same selection, measured, so the trade-off is visible rather than hidden.
+Bold values have Holm p < 0.05 or a CI that excludes 0. In addition, coverage scoring beat end-window scoring by **+7.7** [+3.4, +12.0].
+
+**What this shows:**
+1. **Eviction alone is not lossless.** Every eviction method loses at least 5 points at 1/4 and more below that.
+2. **Spending the same bytes on more tokens at 2–4 bits is far better** than keeping fewer exact tokens: +8 to +11 points at 1/8 and 1/16.
+3. **Coverage selection is what makes the coded arm work.** It beat SnapKV selection at the same code width by about 10 points.
+4. **The best width depends on the budget.** 4 bits won at 1/4; 2 bits won at 1/8 and 1/16. This is the motivation for COVE-QA's per-layer choice.
+5. **`cove_q4` at 1/4 is indistinguishable from the full cache** (+0.1). Non-inferiority is *not* shown, though: the lower CI bound, −1.7, is below the −1 margin. A single task is underpowered, as the v2 brief predicted.
+
+### 1.2 Speed and memory
+
+| Finding | Cause | Fix in v3 |
+|---|---|---|
+| COVE time to first token was 1.7–2.0 s, against 0.41 s for the full cache | Compression took 1.3–1.6 s: the scoring loop synchronised with the host about 720 times per sample, each costing ~1 ms on the shared GPU | Batched scoring with no host synchronisation; it gives the same scores as v2 (relative error 2e-7) |
+| COVE-Q attention was 4–90× slower than full SDPA | The codes were dequantised into memory before SDPA | A fused Triton kernel reads the 2/4-bit codes and dequantises in registers |
+| `native_full` and every press decoded at 16–17 tokens/s, against 47–50 for `cove` | **Measurement artefact.** A FLOP-counting forward pass ran inside their decode timer, with answers of only 3–4 tokens. | FLOP measurement moved outside the timer, plus a fixed-length decode probe (`decode_probe_ms`) |
+| The eager microbenchmark column read ~0.9–2 ms for everything | It measured host-synchronisation latency, not compute | Back-to-back timing |
+
+### 1.3 Where your expectation is wrong for this workload
+
+On qasper (about 4.7k tokens) with a 3B model, the full KV cache is **168 MiB against a 6.4 GiB peak**, and the weights dominate. No KV compressor can make this workload much faster or smaller.
+
+Speed and memory gains appear only at long contexts (32k–128k tokens) or in batched serving. The speed claim therefore has to be tested on RULER at 32k+ and on LongBench-v2, not on qasper.
+
+### 1.4 Baselines that failed in v2, and the fixes
+
+| Baseline | What failed | Fix |
+|---|---|---|
+| CriticalKV | Failed on every item: Qwen2's config has no `head_dim` | Set from the model |
+| PyramidKV | Failed on 75 of 167 items at 1/4: Hugging Face builds one attention mask from layer 0's length | `LayerCausal` builds a mask for each layer |
+| KVgrad, KVzip | Out-of-memory errors from other processes on the shared GPU | Retried, or left for `--resume` |
 
 ---
 
-## 2. Research gaps
+## 2. Research gaps (what the data and the literature leave open)
 
-**G1. Query-agnostic scores are either biased or expensive.**
-- **End-window scores bias towards the last queries:** SnapKV (NeurIPS 2024), PyramidKV (COLM 2025), Ada-KV (NeurIPS 2025).
-- **Cumulative mass is causal:** H2O (NeurIPS 2023).
-- **Context reconstruction costs 2–3× the prefill:** KVzip (NeurIPS 2025), and KVgrad (ICML 2026), which adds a gradient.
-- **Sampled continuations are needed:** LORE-KV (arXiv 2610.07643*).
-- **Parametric query models:** Expected Attention*, GVote (ICLR 2026*).
-- **Key geometry only:** Compactor*, KeyDiff*.
-- **Open question:** is there a score that uses the queries the prefill has already computed, over the whole context, at no extra forward pass, that is as good as reconstruction?
+**G1. Query-agnostic selection without extra cost.**
+- KVzip and KVgrad pay 10–16× the prefill time.
+- KVgrad was the only method that beat COVE at 1/4 and 1/8, using nominal (masked) memory.
 
-**G2. Value- and output-aware scores rest on single-token or loose bounds.**
-- **CAOTE** (ICLR 2026) has the exact single-token change.
-- **CriticalKV** (ICML 2026) bounds the output change with ‖vW_O‖₁ weighting.
-- **What was not found:** using the exact set-level eviction identity (Prop. 1) to justify an additive score.
+**G2. Precision versus token count at equal bytes, chosen per sample and per layer.**
+- MTLP (Findings of EMNLP 2025) fixes one width per budget and uses SnapKV selection.
+- KVTuner* searches layer widths offline.
+- ZipCache (NeurIPS 2024) mixes precisions by token importance.
+- **Not found:** an online, per-layer choice between exact eviction and 4- or 2-bit coding at fixed bytes, made by measuring output distortion on held-out queries of the same context.
 
-**G3. Precision versus token count at equal memory has been studied only with end-window selection.**
-- **MTLP** (Findings of EMNLP 2025) used SnapKV.
-- **Not found:** whether coverage selection changes the optimum, measured on the deployment path with real bytes and real decode time.
+**G3. Quantised caches that are also fast on the deployment path.**
+- Our dequantise-then-SDPA path was 4–90× slower than full attention.
+- Fused low-bit kernels exist (KIVI, QServe*, FlashInfer*). The open engineering question is whether a coded cache from a coverage selection can reach the decode speed of exact eviction at the same bytes.
 
-**G4. "Lossless" is claimed loosely.**
-- KV-compression papers report mean differences.
-- **Not found:** a pre-registered non-inferiority margin with one-sided tests and multiplicity control.
-- Masking implementations (AdaKV, KVzip and KVgrad in kvpress) report nominal, not real, memory.
+**G4. "Lossless" claims without a pre-registered non-inferiority test.** Unchanged from v2.
+
+(* venue not verified against the proceedings.)
 
 ---
 
 ## 3. Contributions, hypotheses and research questions
 
-| RQ | Hypothesis (pre-registered contrast) | Decision rule |
+| H | Claim (pre-registered contrast) | Status after v2 |
 |---|---|---|
-| RQ1. Does coverage pricing beat published query-agnostic and output-aware scores at equal real memory? | **H1:** `cove@r` > each `kvpress:*@r`, including KVzip, KVgrad, CriticalKV, Compactor and Expected Attention, and > `snapkv@r` | One-sided Holm per benchmark, α = 0.05; supported on ≥ 7/9 models plus a Wilcoxon test across models |
-| RQ2. Is the loss relative to the full cache within the margin? | **H2:** NI, `mean(A − native_full) > −δ`, with δ = 1 point (0.01 nat/token for long PPL), for `cove`, `cove_q2` and `cove_q4` at every budget | One-sided α = 0.025 (bootstrap-inversion p), Holm within the non-inferiority family, the 95% CI lower bound > −δ, and ≥ 30 paired units |
-| RQ3. At equal bytes, do more coded tokens beat fewer exact tokens? | **H3:** `cove_q{b}@r` > `cove@r` | As H1 |
-| RQ4. Does coverage selection improve the coded arm? | **H4:** `cove_q{b}@r` > `snapkv_q{b}@r` (MTLP) and > `kvpress:kvzip@r` | As H1 |
-| RQ5. What do speed and memory actually cost? | **H5** is descriptive: `tokens_per_s`, `ttft_s`, `compress_s`, `cache_bytes_measured`, and the one-layer microbenchmark (graph and eager timing) | Reported, not tested |
+| H1 | `cove` > each baseline at the same budget | Supported against real-memory presses except Compactor; **refuted** against KVgrad at 1/4 and 1/8 (nominal memory) |
+| H2 | Non-inferiority to the full cache: margin 1 point, one-sided 0.025, Holm, ≥ 30 units | Not shown for any method; `cove_q4@1/4` is the only candidate (+0.1 [−1.7, +2.0]) |
+| H3 | `cove_qa` (and `cove_q2`, `cove_q4`) > `cove` at the same bytes | Supported for `cove_q2` and `cove_q4` at 1/8 and 1/16 |
+| H4 | `cove_qa` > `cove_q2` and > `cove_q4` (per-layer choice) | **New in v3, untested** |
+| H5 | `cove_qa` > SnapKV + KIVI (MTLP) and > KVzip, KVgrad, CriticalKV, Compactor | `cove_q4` > MTLP at 1/8 and 1/16; the rest untested |
+| H6 | Speed: TTFT, `compress_s`, `decode_probe_ms`, fused kernel vs SDPA (descriptive) | v2 numbers invalid (§1.2); re-measure |
 
-The ablations at 1/8 are `cove_window`, `cove_l2` and `cove_pool5`. Each isolates one design choice.
-
-**Contributions, if the hypotheses hold:**
-- **C1:** the coverage score, with the set-level identity and bound behind it (Props. 1–2).
-- **C2:** COVE-Q, the precision–count trade-off on coverage selection, with its first-order error split (Prop. 4) and real-byte, real-time measurements.
-- **C3:** a deployment-path evaluation at real memory against official implementations, with a pre-registered non-inferiority test.
+**Contributions if the hypotheses hold:**
+- **C1:** coverage selection (Props. 1–2).
+- **C2:** COVE-QA, a per-layer width choice by held-out measured distortion (Props. 4–5).
+- **C3:** a deployment-path evaluation at real memory with a non-inferiority test. The fused kernel is engineering, not a contribution.
 
 ---
 
-## 4. How each gap is addressed in the code
+## 4. How each gap is addressed (functions in `COVE_KV.py`)
 
-| Gap | Mechanism (function) | Test |
+| Gap | Mechanism | Test |
 |---|---|---|
-| G1 | `coverage_groups` and `coverage_scores`: query rows captured during the model's own cached prefill (`CacheCapture`), with no extra pass | H1; `compress_s` against KVzip's and KVgrad's prefill |
-| G2 | `score="l1"`: p_j‖v_j − o‖ in the W_OᵀW_O metric (Prop. 1); the squared single-token price is the `cove_l2` ablation | H1 vs CriticalKV; `cove` vs `cove_l2` |
-| G3 | `cove_q_plan` (bytes-matched counts), `kivi_pack` / `kivi_unpack`, `CodedLayer` (one layer dequantised at a time, then SDPA), optional `torch.compile` fusion | H3, H4; microbenchmark rows `cove_q*` |
-| G4 | `NI:` contrasts; `ni_p_value` inverts the task-stratified bootstrap. A sign-flip test of d + δ would read the items both methods fail (d = 0 exactly) as evidence. Holm within the family; cross-model Wilcoxon test on estimate + δ; masked presses flagged as nominal memory | H2 |
+| G1 | `CoveragePlan` and batched `coverage_scores`: one pass per layer from query rows captured during the model's own prefill | `compress_s` and `ttft_s` vs KVzip and KVgrad; H1 |
+| G2 | `validation_positions` (held-out queries), `choose_width` (distortion D_b of the cache exactly as it will be read), `cove_q_plan` (bytes-matched counts) | H3, H4, H5; the `layer_widths` column |
+| G3 | `_coded_decode_kernel` and `coded_attention` (split-K, dequantisation in registers, exact online-softmax merge); `fused_decode_check` turns the kernel off if it errs; `LayerCausal` | Microbenchmark rows `/fused` vs `/dequant` vs `full_sdpa` vs `cove/sdpa`; `decode_probe_ms` |
+| G4 | `NI:` contrasts (bootstrap-inversion p, Holm, minimum units) | H2 |
 
-**Correctness guards** run at start-up (`cove_tests`) and in `--smoke`:
-- Prop. 1 holds to 8e-14, and its bound holds.
-- Prop. 4's bound holds on random cases.
-- COVE-Q codes dequantise identically to the KIVI baseline (difference 0).
-- The payload equals its analytic size byte for byte.
-- `cove_q_plan` is within budget and maximal.
-- `CodedLayer` returns `[codes ; exact ; new]`.
-- Selection invariants hold.
-- The deployment path agrees with its harness twin for `cove` and `cove_q4`.
-- The full cache agrees with HF `generate()` and with kvpress's own pipeline.
+**Correctness checks, all passed on CPU:**
+- Batched scores equal the v2 per-group scores (2.3e-7 relative).
+- Validation queries are disjoint from scoring queries.
+- At a whole-context budget, COVE-QA keeps width 16 with distortion 0.
+- The fused kernel matches dequantise + SDPA to 4–7e-7 relative error (Triton interpreter).
+- **In generation:**
+  - The fused path gives exactly the same tokens as the dequantise path.
+  - With layers of different widths and lengths, the deployment path gives exactly the same tokens as the fp32 harness.
+- **Smoke run:**
+  - Each deployment path matches its harness twin, for `cove` and `cove_qa` (1.000).
+  - PyramidKV and CriticalKV now run.
 
 ---
 
 ## 5. Kind of novelty
 
-**Kind:** a training-free selection-and-storage method with theory and a pre-registered evaluation. It is an incremental **combination**, not a new paradigm, architecture or kernel.
+**Kind:** a combination and an empirical method, not a new paradigm.
 
-Every element is published or close to it:
+**Published elements:**
+- Coverage scoring from prefill queries is close to H2O, KVzip, EchoPress* and LORE-KV*.
+- The output-aware term is close to CAOTE and CriticalKV.
+- More tokens at lower precision is MTLP.
+- The quantiser is KIVI.
+- Fused decoding is standard.
 
-| Element | Closest prior work |
-|---|---|
-| Output-change score | CAOTE (single token, value space) |
-| Attention × output-projected value | CriticalKV, KVgrad, LaProx* |
-| Whole-context or pseudo-query scoring | H2O, KVzip, EchoPress*, LORE-KV* |
-| More tokens at lower precision | MTLP |
-| Quantiser | KIVI |
+**Not found as such:** an online, per-layer choice of precision versus count at fixed bytes, by held-out measured distortion, on a coverage selection.
 
-**Not found as such:**
-- the set-level identity and triangle bound used to justify an additive p_j‖v_j − o‖ score in the W_OᵀW_O metric;
-- the context's own prefill queries, sampled per segment with per-segment normalisation, at no extra forward pass;
-- equal counts per head, giving a dense SDPA cache;
-- the coded arm on the same selection.
-
-The size of the claim depends entirely on H1 and H4 against KVzip, KVgrad, CriticalKV and MTLP. **LORE-KV, EchoPress and KVgrad are the most likely to pre-empt C1.** Read them in full first.
+**Size of the claim:** in v2, the value-aware score form did not matter (`cove` vs `cove_l2`: +0.5, not significant). What mattered was the coverage and the precision–count trade-off, so v3 builds on those two.
 
 ---
 
-## 6. Are all gaps addressed, and can the result be guaranteed as "100% achieved"?
+## 6. Are the gaps addressed, and is the objective "100% achieved"?
 
-**No.** No method or script can guarantee an empirical result before the experiment, and claiming one would be scientifically wrong.
+**No, and no script can guarantee it before the experiment.**
 
-What can be guaranteed, and is checked, is that:
-- every gap has a mechanism in the code and a pre-registered test;
-- memory is measured in real bytes;
-- speed is measured on the deployment path;
-- the statistics control for multiplicity.
+**What is guaranteed:**
+- Every gap has a mechanism and a pre-registered test.
+- Memory is measured in real bytes.
+- Timings are now valid (§1.2 fixes).
+- The fused kernel and the mixed-length decode path are checked for exactness.
 
-| Gap | In code | Evidence so far | Still open |
-|---|---|---|---|
-| G1 | Yes | The coverage ingredient won in 3 of 3 earlier methods (+4.2 to +18.6, p ≤ 0.001) | COVE against KVzip, KVgrad and CriticalKV was never run |
-| G2 | Yes | Props. 1 and 4 verified numerically | H1 against CriticalKV on real data |
-| G3 | Yes | Toy random-init model (smoke), KL to the full cache at 1/4 memory: `cove_q4` 0.139, `cove` 0.299, `snapkv_q4` 1.086. That is the direction H3 and H4 predict, but it is not evidence about LLMs. On CPU, COVE-Q decoding was 9–12× slower than full attention. | H3 and H4 on real models; COVE-Q decode time on GPU |
-| G4 | Yes | — | H2 needs a large sample (see the note below) |
+**What is still open:**
+1. **The fused kernel's GPU speed is unknown.** It was verified for correctness only, in Triton's interpreter. If it is not faster than full SDPA at 32k+ tokens, the coded arm stays a memory-and-accuracy arm, not a speed arm.
+2. **Whether COVE-QA's per-layer choice beats fixed widths (H4)** is untested.
+3. **Non-inferiority needs about 1,800 paired items** (the LongBench macro average). 167 qasper items cannot show it.
 
-**Sample size for H2.** Under the normal approximation, with true difference 0, one-sided α = 0.025 and 80% power, n ≈ 7.84 σ_d² / δ².
-- σ_d is the standard deviation of the paired per-item differences. It is an assumption here; measure it with `--report`.
-- If σ_d ≈ 15 points, n ≈ 1,800 paired items.
-- The full LongBench macro average (16 tasks × ~200 items) is enough.
-- A single task (≈ 200 items) is not: H2 is decided on the macro average.
+**Expectation, stated honestly:**
+- At 1/4 memory, `cove_qa` or `cove_q4` is the arm most likely to pass non-inferiority.
+- At 1/8, the v2 data show a loss of about 4 points. Removing that loss would need a better selection or more bits, not just engineering.
 
-**What the latest STRATA run does and does not show.**
-- Four qasper items are about 1–2% of what a decision needs. The full cache scored 0 on most of them, so no accuracy conclusion can be drawn from it.
-- What it does show is systems behaviour: compression ≈ 10× prefill, TTFT 6× the full cache, and a decode kernel slower than the full cache. Those are the reasons STRATA is dropped.
-
-**Honest expectations.**
-1. **COVE** will be faster than the full cache, with a measured decode step 1.3–6× faster at 1/4–1/16. Whether it passes the NI test at 1/8 is uncertain: QUASAR lost 6.3 points at 1/8 on Llama-3.2-1B.
-2. **COVE-Q** is the arm most likely to pass NI. At 1/8 memory it keeps about 40% of the tokens at 4 bits. Its decode is not expected to be faster than the full cache at 1/8, and may be close to or slower than it. That trade-off has to be reported.
-3. **If H1 fails against KVzip, KVgrad or CriticalKV,** the honest outcome is an analysis paper: coverage pricing is not enough on its own.
-
-**Run plan, kept small so that a shared GPU does not out-of-memory the run:**
-- Start with `--methods cove kvpress:kvzip kvpress:criticalkv kvpress:kvgrad kvpress:snapkv snapkv_q` on qasper, hotpotqa and trec, with at least 50 items each.
-- Read the result with `--report`.
-- Then go to the full suite across models.
+**Run plan (sequential, on the shared GPU):**
+1. `python COVE_KV.py --microbench 4096 16384 65536 131072 --micro-shape 128 2 8`. This checks whether the kernel delivers.
+2. `python COVE_KV.py --suite longbench --models Qwen2.5-3B-Instruct --methods cove cove_qa cove_q kvpress:kvzip kvpress:kvgrad kvpress:criticalkv kvpress:compactor kvpress:snapkv snapkv_q` (all tasks).
+3. `python COVE_KV.py --suite ruler --models Qwen2.5-3B-Instruct --methods cove cove_qa kvpress:snapkv kvpress:compactor`. This is the long-context speed and memory test.
+4. Read results with `--report` at any time.
